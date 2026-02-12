@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+orchestrator/logs/*.log*
+.DS_Store
