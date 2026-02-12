@@ -37,11 +37,15 @@ class PipelineContext:
     issue_num: int
     branch_name: str
     issue_body: str = ""
+    issue_title: str = ""
     design_doc: str = ""
     git_diff: str = ""
     review_report: str = ""
     audit_result: str = ""
     audit_passed: bool = False
+    retry_count: int = 0
+    review_feedback: str = ""
+    review_passed: bool = False
     steps: list[PipelineStep] = field(default_factory=lambda: [
         PipelineStep(name="DeepSeek Design"),
         PipelineStep(name="Claude Implement"),
@@ -162,7 +166,13 @@ async def step_fetch_issue(ctx: PipelineContext) -> None:
     if proc.returncode != 0:
         err = stderr.decode(errors="replace") if stderr else "unknown error"
         raise RuntimeError(f"gh issue view failed: {err}")
-    ctx.issue_body = stdout.decode(errors="replace") if stdout else ""
+    raw = stdout.decode(errors="replace") if stdout else ""
+    ctx.issue_body = raw
+    try:
+        import json
+        ctx.issue_title = json.loads(raw).get("title", "")
+    except Exception:
+        ctx.issue_title = ""
 
 
 async def step_deepseek_design(
@@ -220,9 +230,10 @@ async def step_claude_implement(
     settings: Settings,
     cancel_event: asyncio.Event,
     progress_cb: ProgressCallback,
+    step_index: int = 1,
 ) -> None:
     """Step 2: Claude CLI implements based on DeepSeek's design."""
-    step = ctx.steps[1]
+    step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
 
@@ -231,8 +242,23 @@ async def step_claude_implement(
         f"Then read GitHub issue #{ctx.issue_num} with `gh issue view {ctx.issue_num}`. "
         f"\n\n--- Design Guide (from DeepSeek) ---\n{ctx.design_doc}\n---\n\n"
         f"Implement the solution following this design guide. "
-        f"Complete all steps including testing."
+        f"IMPORTANT: After implementation, you MUST run the project's compile/build command "
+        f"to verify there are no compilation errors before finishing. "
+        f"Fix any compile errors before proceeding. "
+        f"Complete all steps including testing.\n\n"
+        f"GIT RESTRICTIONS (OVERRIDE CLAUDE.md Section 6):\n"
+        f"- Do NOT create any branches. You are already on the correct branch.\n"
+        f"- Do NOT run git push.\n"
+        f"- Do NOT run gh pr create.\n"
+        f"- Only commit your changes locally. Branch management and PR creation are handled externally."
     )
+
+    if ctx.review_feedback:
+        prompt += (
+            f"\n\n--- Previous Review Feedback (MUST address these issues) ---\n"
+            f"{ctx.review_feedback}\n---\n\n"
+            f"The previous implementation was rejected. Fix ALL issues mentioned above."
+        )
 
     claude_cmd = (
         f'claude -p --dangerously-skip-permissions '
@@ -322,9 +348,10 @@ async def step_claude_review(
     ctx: PipelineContext,
     anthropic: AnthropicProvider | None,
     settings: Settings,
+    step_index: int = 2,
 ) -> None:
     """Step 3: Claude reviews the implementation via Anthropic API (or CLI fallback)."""
-    step = ctx.steps[2]
+    step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
 
@@ -362,20 +389,29 @@ async def step_claude_review(
         verdict = parse_verdict(review_text)
 
         if verdict is True:
+            ctx.review_passed = True
             step.status = "passed"
             step.detail = "VERDICT: PASS"
+            logger.info("Review PASSED for issue #%d", ctx.issue_num)
         elif verdict is False:
+            ctx.review_passed = False
             step.status = "failed"
             step.detail = "VERDICT: FAIL"
-            raise RuntimeError("Claude review returned FAIL")
+            logger.warning(
+                "Review FAILED for issue #%d. Full review report:\n%s",
+                ctx.issue_num, review_text,
+            )
         else:
+            ctx.review_passed = False
             step.status = "failed"
             step.detail = "No verdict tag found — treated as FAIL"
-            raise RuntimeError("Claude review did not include [VERDICT: PASS/FAIL]")
+            logger.warning(
+                "Review returned no verdict for issue #%d. Full review report:\n%s",
+                ctx.issue_num, review_text,
+            )
 
-    except RuntimeError:
-        raise
     except Exception as exc:
+        ctx.review_passed = False
         step.status = "failed"
         step.detail = str(exc)[:200]
         raise
@@ -388,9 +424,10 @@ async def step_deepseek_audit(
     ollama: OllamaProvider,
     settings: Settings,
     progress_cb: ProgressCallback,
+    step_index: int = -1,
 ) -> None:
     """Step 4: DeepSeek final audit of the implementation."""
-    step = ctx.steps[3]
+    step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
 
@@ -460,7 +497,9 @@ async def run_dual_check_pipeline(
     cancel_event: asyncio.Event,
     progress_cb: ProgressCallback,
 ) -> tuple[str, str]:
-    """Run the full 4-step pipeline. Returns (status, detail)."""
+    """Run the full 4-step pipeline with automatic retry on review failure. Returns (status, detail)."""
+    max_retries = settings.max_review_retries
+
     try:
         # Fetch issue
         await progress_cb("Fetching issue...")
@@ -469,32 +508,61 @@ async def run_dual_check_pipeline(
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 1: DeepSeek Design
+        # Step 1: DeepSeek Design (once)
         await progress_cb("[1/4] DeepSeek Design...")
         await step_deepseek_design(ctx, ollama, settings, progress_cb)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 2: Claude Implement
-        await progress_cb("[2/4] Claude Implement...")
-        await step_claude_implement(ctx, settings, cancel_event, progress_cb)
+        # Steps 2+3: Implement + Review (retry loop)
+        for attempt in range(max_retries + 1):
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
+
+            # On retry: reset worktree and add new step entries
+            if attempt > 0:
+                ctx.retry_count = attempt
+                await _reset_worktree(ctx.project_path)
+                # Insert new step pair before the last step (DeepSeek Audit)
+                ctx.steps.insert(-1, PipelineStep(name=f"Claude Implement (retry {attempt})"))
+                ctx.steps.insert(-1, PipelineStep(name=f"Claude Review (retry {attempt})"))
+
+            step_idx_impl = 1 + (attempt * 2)
+            step_idx_review = 2 + (attempt * 2)
+
+            # Step 2: Claude Implement
+            attempt_label = f" (retry {attempt})" if attempt > 0 else ""
+            await progress_cb(f"[2/4] Claude Implement{attempt_label}...")
+            await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=step_idx_impl)
+
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
+
+            # Step 3: Claude Review
+            await progress_cb(f"[3/4] Claude Review{attempt_label}...")
+            await step_claude_review(ctx, anthropic, settings, step_index=step_idx_review)
+
+            if ctx.review_passed:
+                break
+
+            # Review failed — retry if possible
+            if attempt < max_retries:
+                ctx.review_feedback = ctx.review_report
+                await progress_cb(
+                    f"Review failed (attempt {attempt + 1}/{max_retries + 1}), retrying..."
+                )
+            else:
+                return "failed", f"Claude Review: VERDICT: FAIL (after {attempt + 1} attempts)"
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 3: Claude Review
-        await progress_cb("[3/4] Claude Review...")
-        await step_claude_review(ctx, anthropic, settings)
-
-        if cancel_event.is_set():
-            return "skipped", "Cancelled by user"
-
-        # Step 4: DeepSeek Audit
+        # Step 4: DeepSeek Audit (always last step)
         await progress_cb("[4/4] DeepSeek Audit...")
-        await step_deepseek_audit(ctx, ollama, settings, progress_cb)
+        await step_deepseek_audit(ctx, ollama, settings, progress_cb, step_index=-1)
 
-        return "success", "All 4 checks passed"
+        return "success", "All checks passed"
 
     except asyncio.CancelledError:
         return "skipped", "Cancelled by user"
@@ -533,16 +601,53 @@ async def _snapshot_commit(project_path: str, issue_num: int) -> None:
     await asyncio.wait_for(commit_proc.communicate(), timeout=15)
 
 
+async def _reset_worktree(project_path: str) -> None:
+    """Reset worktree to clean state for retry."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "reset", "--hard", "origin/main",
+        cwd=project_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=15)
+    proc = await asyncio.create_subprocess_exec(
+        "git", "clean", "-fd",
+        cwd=project_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=15)
+
+
 async def _claude_cli_review(project_path: str, prompt: str) -> str:
-    """Fallback: run Claude CLI for review when Anthropic API is unavailable."""
-    proc = await asyncio.create_subprocess_shell(
-        f"claude -p {_shell_quote(prompt)}",
+    """Run Claude CLI for review, passing prompt via stdin to avoid shell length limits."""
+    proc = await asyncio.create_subprocess_exec(
+        "claude", "-p", "--output-format", "text",
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        stderr=asyncio.subprocess.PIPE,
         cwd=project_path,
     )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
-    return stdout.decode(errors="replace") if stdout else ""
+    stdout, stderr = await asyncio.wait_for(
+        proc.communicate(input=prompt.encode()), timeout=300,
+    )
+    output = stdout.decode(errors="replace") if stdout else ""
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace") if stderr else ""
+        logger.error("Claude CLI review failed (exit=%d): %s", proc.returncode, err[:500])
+        raise RuntimeError(f"Claude CLI exit={proc.returncode}: {err[:200]}")
+    if not output.strip():
+        logger.error("Claude CLI review returned empty output")
+        raise RuntimeError("Claude CLI returned empty response")
+    return output
+
+
+def _extract_review_summary(review_report: str, max_chars: int = 1500) -> str:
+    """Extract key failure points from review report for Telegram display."""
+    if not review_report:
+        return "(no review details)"
+    idx = review_report.upper().rfind("VERDICT")
+    if idx > 200:
+        summary = review_report[max(0, idx - 1500):idx + 200]
+    else:
+        summary = review_report[-max_chars:]
+    return summary.strip()
 
 
 def format_pipeline_summary(ctx: PipelineContext) -> str:
@@ -563,4 +668,11 @@ def format_pipeline_summary(ctx: PipelineContext) -> str:
             elapsed_str = f" ({mins}m {secs}s)" if mins else f" ({secs}s)"
 
         lines.append(f"  {icon} {s.name}{elapsed_str}")
+
+    # Append review feedback when review failed
+    review_step = next((s for s in ctx.steps if "Review" in s.name and s.status == "failed"), None)
+    if review_step and ctx.review_report:
+        summary = _extract_review_summary(ctx.review_report)
+        lines.append(f"\n\U0001f4cb Review Feedback:\n{summary[:3000]}")
+
     return "\n".join(lines)

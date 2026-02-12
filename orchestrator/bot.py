@@ -21,6 +21,7 @@ from .handlers import (
     issues_handler,
     process_callback_handler,
     projects_handler,
+    rebase_handler,
     service_handler,
     solve_cancel_callback,
     solve_handler,
@@ -66,6 +67,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("projects", "List registered projects"),
         BotCommand("issues", "Open GitHub issues for a project"),
         BotCommand("solve", "Auto-solve issues via Claude"),
+        BotCommand("rebase", "Rebase PR onto main"),
     ])
 
     logger.info("Bot initialized — polling started")
@@ -116,6 +118,7 @@ def create_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("projects", projects_handler, filters=auth))
     app.add_handler(CommandHandler("issues", issues_handler, filters=auth))
     app.add_handler(CommandHandler("solve", solve_handler, filters=auth))
+    app.add_handler(CommandHandler("rebase", rebase_handler, filters=auth))
     app.add_handler(CommandHandler("help", help_handler, filters=auth))
 
     # Inline keyboard callbacks

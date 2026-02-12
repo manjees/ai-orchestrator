@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     deepseek_audit_timeout: int = 600    # Step 4: 10 min
     deepseek_design_max_tokens: int = 8192
     deepseek_audit_max_tokens: int = 4096
+    max_review_retries: int = 2
 
 
 def load_projects() -> dict[str, dict]:

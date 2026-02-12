@@ -6,4 +6,6 @@ __pycache__/
 dist/
 build/
 orchestrator/logs/*.log*
+orchestrator/projects.json
+.claude/
 .DS_Store

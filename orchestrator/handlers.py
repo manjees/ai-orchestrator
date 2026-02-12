@@ -1,4 +1,4 @@
-"""Telegram command handlers: /status, /cmd, /view, /projects, /issues, /solve, and process control."""
+"""Telegram command handlers: /status, /cmd, /view, /projects, /issues, /solve, /rebase, and process control."""
 
 from __future__ import annotations
 
@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # Process names to monitor for inline keyboard control
 _MONITORED_PROCESSES = {"ollama", "python", "node"}
 
-# Active solve sessions keyed by chat_id → asyncio.Event (set = cancel requested)
-_solve_cancels: dict[int, asyncio.Event] = {}
+# Active solve sessions: chat_id → {issue_num → asyncio.Event}
+_solve_cancels: dict[int, dict[int, asyncio.Event]] = {}
 _solve_active: set[int] = set()
 
 # ANSI escape codes: CSI sequences (incl. ?/= private modes), OSC sequences, single ESC codes
@@ -611,14 +611,21 @@ async def solve_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         data = query.data or ""
-        # cancel_solve:<chat_id>
-        _, chat_id_str = data.split(":", 1)
-        chat_id = int(chat_id_str)
+        parts = data.split(":")
+        # cancel_solve:<chat_id>:<issue_num> (new) or cancel_solve:<chat_id> (legacy)
+        chat_id = int(parts[1])
+        issue_num = int(parts[2]) if len(parts) > 2 else None
 
-        cancel_event = _solve_cancels.get(chat_id)
-        if cancel_event:
-            cancel_event.set()
-            await query.edit_message_text("Cancel requested. Stopping after current step...")
+        events = _solve_cancels.get(chat_id)
+        if events:
+            if issue_num and issue_num in events:
+                events[issue_num].set()
+                await query.edit_message_text(f"Cancel requested for #{issue_num}. Stopping after current step...")
+            else:
+                # Cancel all issues for this chat
+                for ev in events.values():
+                    ev.set()
+                await query.edit_message_text("Cancel requested for all issues. Stopping after current step...")
         else:
             await query.edit_message_text("No active solve session to cancel.")
     except Exception:
@@ -644,8 +651,9 @@ async def _start_solve(
         return
 
     _solve_active.add(chat_id)
-    cancel_event = asyncio.Event()
-    _solve_cancels[chat_id] = cancel_event
+    # Create per-issue cancel events
+    cancel_events = {num: asyncio.Event() for num in issue_nums}
+    _solve_cancels[chat_id] = cancel_events
 
     projects: dict = context.bot_data.get("projects", {})
     project_path = projects[project_name]["path"]
@@ -654,7 +662,7 @@ async def _start_solve(
 
     # Run in background so the handler returns immediately
     asyncio.create_task(
-        _solve_issues(context, chat_id, project_name, project_path, issue_nums, timeout, cancel_event)
+        _solve_issues(context, chat_id, project_name, project_path, issue_nums, timeout, cancel_events)
     )
 
     nums_str = ", ".join(f"#{n}" for n in issue_nums)
@@ -672,21 +680,45 @@ async def _solve_issues(
     project_path: str,
     issue_nums: list[int],
     timeout: int,
-    cancel_event: asyncio.Event,
+    cancel_events: dict[int, asyncio.Event],
 ) -> None:
-    """Sequentially solve each issue: git fresh start → claude → PR."""
+    """Solve issues in parallel using git worktrees."""
     results: list[tuple[int, str, str]] = []  # (issue#, status, detail)
 
     try:
-        for issue_num in issue_nums:
-            if cancel_event.is_set():
-                results.append((issue_num, "skipped", "Cancelled by user"))
-                continue
+        # Ensure main repo is on 'main' so solve branches aren't "in use" by worktrees
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", "main",
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=10)
 
+        if len(issue_nums) == 1:
+            # Single issue — no need for gather overhead
+            num = issue_nums[0]
             status, detail = await _solve_single_issue(
-                context, chat_id, project_name, project_path, issue_num, timeout, cancel_event,
+                context, chat_id, project_name, project_path,
+                num, timeout, cancel_events[num],
             )
-            results.append((issue_num, status, detail))
+            results.append((num, status, detail))
+        else:
+            # Multiple issues — run in parallel with independent cancel events
+            tasks = [
+                _solve_single_issue(
+                    context, chat_id, project_name, project_path,
+                    issue_num, timeout, cancel_events[issue_num],
+                )
+                for issue_num in issue_nums
+            ]
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            for issue_num, outcome in zip(issue_nums, outcomes):
+                if isinstance(outcome, Exception):
+                    logger.exception("Parallel solve error for #%d", issue_num, exc_info=outcome)
+                    results.append((issue_num, "failed", str(outcome)[:100]))
+                else:
+                    results.append((issue_num, outcome[0], outcome[1]))
     except Exception:
         logger.exception("Solve loop error")
     finally:
@@ -752,7 +784,7 @@ async def _solve_with_dual_check(
     branch_name = f"solve/issue-{issue_num}"
 
     cancel_btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Cancel", callback_data=f"cancel_solve:{chat_id}")]
+        [InlineKeyboardButton("Cancel", callback_data=f"cancel_solve:{chat_id}:{issue_num}")]
     ])
     msg = await context.bot.send_message(
         chat_id,
@@ -763,19 +795,22 @@ async def _solve_with_dual_check(
 
     pipeline_start = time.monotonic()
 
+    worktree_dir = ""
     try:
-        # ── Git Fresh Start ──
-        git_ok, git_err = await _git_fresh_start(project_path, branch_name)
+        # ── Git Worktree Setup ──
+        git_ok, git_result = await _git_fresh_start(project_path, branch_name)
         if not git_ok:
-            await _edit_msg(msg, f"<b>#{issue_num}</b> — Git setup failed:\n<pre>{_sanitize_output(git_err)}</pre>")
-            return "failed", f"Git setup failed: {git_err[:100]}"
+            await _edit_msg(msg, f"<b>#{issue_num}</b> — Git setup failed:\n<pre>{_sanitize_output(git_result)}</pre>")
+            return "failed", f"Git setup failed: {git_result[:100]}"
+
+        worktree_dir = git_result  # on success, this is the worktree path
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Build pipeline context
+        # Build pipeline context — use worktree_dir as working directory
         ctx = PipelineContext(
-            project_path=project_path,
+            project_path=worktree_dir,
             project_name=project_name,
             issue_num=issue_num,
             branch_name=branch_name,
@@ -807,10 +842,19 @@ async def _solve_with_dual_check(
         mins, secs = divmod(elapsed, 60)
         total_time = f"{mins}m {secs}s" if mins else f"{secs}s"
 
+        if status == "success" and cancel_event.is_set():
+            summary = format_pipeline_summary(ctx)
+            await _edit_msg(
+                msg,
+                f"<b>#{issue_num}</b> ⏭ Cancelled before PR creation\n[{total_time}]\n\n"
+                f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
+            )
+            return "skipped", "Cancelled before PR creation"
+
         if status == "success":
-            # Create PR
+            # Create PR — push from worktree
             await _edit_msg(msg, f"<b>#{issue_num}</b> — Creating PR...")
-            pr_url, pr_err = await _create_pr(project_path, issue_num, branch_name)
+            pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title)
 
             summary = format_pipeline_summary(ctx)
             if pr_url:
@@ -842,6 +886,9 @@ async def _solve_with_dual_check(
         logger.exception("Error in dual-check pipeline for issue #%d", issue_num)
         await _edit_msg(msg, f"<b>#{issue_num}</b> — Error: {html.escape(str(exc)[:200])}")
         return "failed", str(exc)[:100]
+    finally:
+        if worktree_dir:
+            await _cleanup_worktree(project_path, worktree_dir, branch_name)
 
 
 async def _solve_direct_claude(
@@ -857,7 +904,7 @@ async def _solve_direct_claude(
     branch_name = f"solve/issue-{issue_num}"
 
     cancel_btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Cancel", callback_data=f"cancel_solve:{chat_id}")]
+        [InlineKeyboardButton("Cancel", callback_data=f"cancel_solve:{chat_id}:{issue_num}")]
     ])
     msg = await context.bot.send_message(
         chat_id,
@@ -866,12 +913,15 @@ async def _solve_direct_claude(
         reply_markup=cancel_btn,
     )
 
+    worktree_dir = ""
     try:
-        # ── Git Fresh Start ──
-        git_ok, git_err = await _git_fresh_start(project_path, branch_name)
+        # ── Git Worktree Setup ──
+        git_ok, git_result = await _git_fresh_start(project_path, branch_name)
         if not git_ok:
-            await _edit_msg(msg, f"<b>#{issue_num}</b> — Git setup failed:\n<pre>{_sanitize_output(git_err)}</pre>")
-            return "failed", f"Git setup failed: {git_err[:100]}"
+            await _edit_msg(msg, f"<b>#{issue_num}</b> — Git setup failed:\n<pre>{_sanitize_output(git_result)}</pre>")
+            return "failed", f"Git setup failed: {git_result[:100]}"
+
+        worktree_dir = git_result
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
@@ -895,7 +945,7 @@ async def _solve_direct_claude(
             claude_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=project_path,
+            cwd=worktree_dir,
         )
         assert proc.stdout is not None
 
@@ -960,10 +1010,14 @@ async def _solve_direct_claude(
             )
             return "failed", f"Claude exit={rc} after {time_str}"
 
+        # ── Cancel check before PR ──
+        if cancel_event.is_set():
+            return "skipped", f"Cancelled before PR creation (Claude done in {time_str})"
+
         # ── Auto PR ──
         await _edit_msg(msg, f"<b>#{issue_num}</b> — Claude done ({time_str}). Creating PR...")
 
-        pr_url, pr_err = await _create_pr(project_path, issue_num, branch_name)
+        pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name)
         if pr_url:
             await _edit_msg(msg, f"<b>#{issue_num}</b> \u2705 Solved in {time_str}\nPR: {pr_url}")
             return "success", f"PR created: {pr_url}"
@@ -978,51 +1032,115 @@ async def _solve_direct_claude(
         logger.exception("Error solving issue #%d", issue_num)
         await _edit_msg(msg, f"<b>#{issue_num}</b> — Error: {html.escape(str(exc)[:200])}")
         return "failed", str(exc)[:100]
+    finally:
+        if worktree_dir:
+            await _cleanup_worktree(project_path, worktree_dir, branch_name)
 
 
 async def _git_fresh_start(project_path: str, branch_name: str) -> tuple[bool, str]:
-    """Reset to main, pull, create new branch. Returns (ok, error_msg)."""
-    commands = [
-        # Stash any dirty changes
-        ["git", "stash", "--include-untracked"],
-        # Checkout main
-        ["git", "checkout", "main"],
-        # Pull latest
-        ["git", "pull"],
-        # Create and checkout new branch (delete if exists)
-        ["git", "branch", "-D", branch_name],  # may fail — that's ok
-    ]
+    """Create a git worktree for the branch. Returns (ok, error_or_worktree_path).
 
-    for cmd in commands:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=project_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-        output = stdout.decode(errors="replace") if stdout else ""
-        # Allow branch -D to fail (branch may not exist)
-        if proc.returncode != 0 and cmd[1] != "branch":
-            return False, f"{' '.join(cmd)} failed: {output}"
+    On success, the second element is the worktree path.
+    On failure, the second element is the error message.
+    """
+    import os
+    import shutil
 
-    # Create new branch
+    worktree_dir = os.path.join(project_path, ".worktrees", branch_name.replace("/", "-"))
+
+    # 1. Force remove worktree directory if it exists
+    if os.path.exists(worktree_dir):
+        shutil.rmtree(worktree_dir, ignore_errors=True)
+
+    # 3. Prune stale worktree references
     proc = await asyncio.create_subprocess_exec(
-        "git", "checkout", "-b", branch_name,
+        "git", "worktree", "prune",
         cwd=project_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    await asyncio.wait_for(proc.communicate(), timeout=10)
+
+    # 4. Force delete branch if it exists (from a previous run)
+    proc = await asyncio.create_subprocess_exec(
+        "git", "branch", "-D", branch_name,
+        cwd=project_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=10)
+    # Ignore errors — branch may not exist
+
+    # 5. Fetch latest main
+    proc = await asyncio.create_subprocess_exec(
+        "git", "fetch", "origin", "main",
+        cwd=project_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
     if proc.returncode != 0:
         output = stdout.decode(errors="replace") if stdout else ""
-        return False, f"git checkout -b failed: {output}"
+        return False, f"git fetch failed: {output}"
 
-    return True, ""
+    # 5. Create worktree with new branch based on origin/main
+    proc = await asyncio.create_subprocess_exec(
+        "git", "worktree", "add", "-B", branch_name, worktree_dir, "origin/main",
+        cwd=project_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+    if proc.returncode != 0:
+        output = stdout.decode(errors="replace") if stdout else ""
+        return False, f"git worktree add failed: {output}"
+
+    return True, worktree_dir
 
 
-async def _create_pr(project_path: str, issue_num: int, branch_name: str) -> tuple[str, str]:
-    """Push branch and create PR. Returns (pr_url, error_msg)."""
+async def _cleanup_worktree(project_path: str, worktree_dir: str, branch_name: str) -> None:
+    """Remove worktree and optionally the branch after solve completes."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "worktree", "remove", "--force", worktree_dir,
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=15)
+    except Exception:
+        logger.warning("Failed to remove worktree %s", worktree_dir)
+
+
+async def _create_pr(project_path: str, issue_num: int, branch_name: str, issue_title: str = "") -> tuple[str, str]:
+    """Squash commits, push branch, and create PR. Returns (pr_url, error_msg)."""
+    # Build PR title from issue title
+    if issue_title:
+        pr_title = f"feat: {issue_title}"
+    else:
+        pr_title = f"feat: resolve #{issue_num}"
+    squash_msg = f"{pr_title}\n\nCloses #{issue_num}"
+
+    # Squash all commits on this branch into one
+    proc = await asyncio.create_subprocess_exec(
+        "git", "reset", "--soft", "origin/main",
+        cwd=project_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=15)
+
+    proc = await asyncio.create_subprocess_exec(
+        "git", "commit", "-m", squash_msg,
+        cwd=project_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+    if proc.returncode != 0:
+        output = stdout.decode(errors="replace") if stdout else "squash commit failed"
+        logger.warning("Squash commit failed for #%d: %s", issue_num, output[:200])
+
     # Push
     proc = await asyncio.create_subprocess_exec(
         "git", "push", "-u", "origin", branch_name,
@@ -1037,8 +1155,8 @@ async def _create_pr(project_path: str, issue_num: int, branch_name: str) -> tup
     # Create PR
     proc = await asyncio.create_subprocess_exec(
         "gh", "pr", "create",
-        "--title", f"fix: resolve #{issue_num}",
-        "--body", f"Automatically solved by ai-orchestrator\n\nCloses #{issue_num}",
+        "--title", pr_title,
+        "--body", f"Closes #{issue_num}",
         cwd=project_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -1065,6 +1183,217 @@ async def _edit_msg(msg, text: str, reply_markup=None) -> None:
             pass
 
 
+# ── /rebase ──────────────────────────────────────────────────────────────────
+
+async def rebase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rebase a PR branch onto main: /rebase <project> <pr#>"""
+    try:
+        if not context.args or len(context.args) < 2:
+            await _safe_reply(update, "Usage: <code>/rebase &lt;project&gt; &lt;pr#&gt;</code>")
+            return
+
+        project_name = context.args[0]
+        projects: dict = context.bot_data.get("projects", {})
+        if project_name not in projects:
+            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+            return
+
+        try:
+            pr_number = int(context.args[1])
+        except ValueError:
+            await _safe_reply(update, f"Invalid PR number: <code>{html.escape(context.args[1])}</code>")
+            return
+
+        project_path = projects[project_name]["path"]
+        settings = context.bot_data["settings"]
+        chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+        # Get branch name from PR
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "pr", "view", str(pr_number), "--json", "headRefName",
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode != 0:
+            output = stdout.decode(errors="replace") if stdout else "gh pr view failed"
+            await _safe_reply(update, f"Failed to get PR info:\n<pre>{_sanitize_output(output)}</pre>")
+            return
+
+        import json as _json
+        pr_info = _json.loads(stdout.decode(errors="replace"))
+        branch_name = pr_info["headRefName"]
+
+        msg = await context.bot.send_message(
+            chat_id,
+            f"<b>#{pr_number}</b> Rebasing <code>{html.escape(branch_name)}</code> onto main...",
+            parse_mode=ParseMode.HTML,
+        )
+
+        # Run rebase in background
+        asyncio.create_task(
+            _rebase_pr(context, chat_id, msg, project_path, pr_number, branch_name, settings)
+        )
+    except Exception:
+        logger.exception("/rebase handler error")
+        await _safe_reply(update, "Error starting rebase.")
+
+
+async def _rebase_pr(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    msg,
+    project_path: str,
+    pr_number: int,
+    branch_name: str,
+    settings,
+) -> None:
+    """Rebase a PR branch onto origin/main, using Claude to resolve conflicts if needed."""
+    worktree_dir = os.path.join(project_path, ".worktrees", f"rebase-{branch_name.replace('/', '-')}")
+
+    try:
+        # ── Step A: Git preparation ──
+        import shutil
+        if os.path.exists(worktree_dir):
+            shutil.rmtree(worktree_dir, ignore_errors=True)
+
+        # Prune stale worktrees
+        proc = await asyncio.create_subprocess_exec(
+            "git", "worktree", "prune",
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=10)
+
+        # Fetch latest main and the PR branch
+        proc = await asyncio.create_subprocess_exec(
+            "git", "fetch", "origin", "main", branch_name,
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            output = stdout.decode(errors="replace") if stdout else ""
+            await _edit_msg(msg, f"<b>#{pr_number}</b> ❌ Fetch failed:\n<pre>{_sanitize_output(output)}</pre>")
+            return
+
+        # Create worktree on the existing PR branch
+        proc = await asyncio.create_subprocess_exec(
+            "git", "worktree", "add", worktree_dir, f"origin/{branch_name}",
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode != 0:
+            output = stdout.decode(errors="replace") if stdout else ""
+            await _edit_msg(msg, f"<b>#{pr_number}</b> ❌ Worktree setup failed:\n<pre>{_sanitize_output(output)}</pre>")
+            return
+
+        # Ensure the worktree tracks the remote branch for push
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", "-B", branch_name, f"origin/{branch_name}",
+            cwd=worktree_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=10)
+
+        # ── Step B: Rebase attempt ──
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rebase", "origin/main",
+            cwd=worktree_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        rebase_rc = proc.returncode
+
+        if rebase_rc != 0:
+            # ── Step C: Claude resolves conflicts ──
+            await _edit_msg(
+                msg,
+                f"<b>#{pr_number}</b> Rebase conflict detected, resolving with Claude...",
+            )
+
+            # Abort the failed rebase first so Claude starts clean
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rebase", "--abort",
+                cwd=worktree_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=10)
+
+            claude_cmd = (
+                'claude -p --dangerously-skip-permissions '
+                '"There are git merge conflicts from rebasing onto main. '
+                'First run: git rebase origin/main. '
+                'Then resolve ALL conflicts in the current working directory. '
+                'For each conflicted file, read it, resolve the conflict markers, and write the fixed version. '
+                'Then run: git add <file> for each resolved file. '
+                'After ALL conflicts are resolved, run: git rebase --continue. '
+                'Repeat until the rebase is fully complete. '
+                'Do NOT create branches, push, or create PRs. '
+                'GIT RESTRICTIONS: Do NOT run git push or gh pr create."'
+            )
+
+            claude_proc = await asyncio.create_subprocess_shell(
+                claude_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=worktree_dir,
+            )
+            claude_stdout, _ = await asyncio.wait_for(
+                claude_proc.communicate(), timeout=settings.solve_timeout
+            )
+
+            if claude_proc.returncode != 0:
+                # Abort rebase if Claude failed
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "rebase", "--abort",
+                    cwd=worktree_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=10)
+
+                output = claude_stdout.decode(errors="replace") if claude_stdout else "(no output)"
+                preview = _sanitize_output(mask_secrets(output[-500:]))
+                await _edit_msg(
+                    msg,
+                    f"<b>#{pr_number}</b> ❌ Rebase failed: Claude could not resolve conflicts\n<pre>{preview}</pre>",
+                )
+                return
+
+        # ── Step D: Force push ──
+        proc = await asyncio.create_subprocess_exec(
+            "git", "push", "--force-with-lease", "origin", branch_name,
+            cwd=worktree_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            output = stdout.decode(errors="replace") if stdout else ""
+            await _edit_msg(msg, f"<b>#{pr_number}</b> ❌ Push failed:\n<pre>{_sanitize_output(output)}</pre>")
+            return
+
+        await _edit_msg(msg, f"<b>#{pr_number}</b> ✅ Rebased and pushed successfully")
+
+    except asyncio.TimeoutError:
+        await _edit_msg(msg, f"<b>#{pr_number}</b> ❌ Rebase timed out")
+    except Exception as exc:
+        logger.exception("Error rebasing PR #%d", pr_number)
+        await _edit_msg(msg, f"<b>#{pr_number}</b> ❌ Rebase failed: {html.escape(str(exc)[:200])}")
+    finally:
+        # ── Step E: Cleanup worktree ──
+        await _cleanup_worktree(project_path, worktree_dir, branch_name="")
+
+
 # ── /help ────────────────────────────────────────────────────────────────────
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1080,6 +1409,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/projects — List registered projects\n"
         "/issues &lt;project&gt; — Open GitHub issues (with Solve buttons)\n"
         "/solve &lt;project&gt; &lt;#&gt; [#...] — Auto-solve issues via Claude\n"
+        "/rebase &lt;project&gt; &lt;pr#&gt; — Rebase PR onto latest main\n"
         "\n"
         "/help — This message"
     )
