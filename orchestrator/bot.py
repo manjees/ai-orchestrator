@@ -17,6 +17,7 @@ from .ai.ollama_provider import OllamaProvider
 from .config import Settings, load_projects
 from .handlers import (
     cmd_handler,
+    extract_handler,
     help_handler,
     issues_handler,
     process_callback_handler,
@@ -68,6 +69,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("issues", "Open GitHub issues for a project"),
         BotCommand("solve", "Auto-solve issues via Claude"),
         BotCommand("rebase", "Rebase PR onto main"),
+        BotCommand("extract", "Generate training data from file"),
     ])
 
     logger.info("Bot initialized — polling started")
@@ -119,6 +121,7 @@ def create_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("issues", issues_handler, filters=auth))
     app.add_handler(CommandHandler("solve", solve_handler, filters=auth))
     app.add_handler(CommandHandler("rebase", rebase_handler, filters=auth))
+    app.add_handler(CommandHandler("extract", extract_handler, filters=auth))
     app.add_handler(CommandHandler("help", help_handler, filters=auth))
 
     # Inline keyboard callbacks

@@ -1161,7 +1161,7 @@ async def _create_pr(project_path: str, issue_num: int, branch_name: str, issue_
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
     output = stdout.decode(errors="replace").strip() if stdout else ""
     if proc.returncode != 0:
         return "", output or "gh pr create failed"
@@ -1394,6 +1394,93 @@ async def _rebase_pr(
         await _cleanup_worktree(project_path, worktree_dir, branch_name="")
 
 
+# ── /extract ──────────────────────────────────────────────────────────────────
+
+async def extract_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate training data from a file: /extract <project> <file_path>"""
+    try:
+        if not context.args or len(context.args) < 2:
+            await _safe_reply(update, "Usage: <code>/extract &lt;project&gt; &lt;file_path&gt;</code>")
+            return
+
+        project_name = context.args[0]
+        file_rel_path = " ".join(context.args[1:])
+
+        projects: dict = context.bot_data.get("projects", {})
+        if project_name not in projects:
+            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+            return
+
+        project_path = projects[project_name]["path"]
+        file_path = os.path.join(project_path, file_rel_path)
+
+        if not os.path.isfile(file_path):
+            await _safe_reply(update, f"File not found: <code>{html.escape(file_rel_path)}</code>")
+            return
+
+        settings = context.bot_data["settings"]
+        ollama: OllamaProvider | None = context.bot_data.get("ollama")
+        if not ollama:
+            await _safe_reply(update, "Ollama is not configured.")
+            return
+
+        # Read file content (cap at 50K chars)
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(50_000)
+
+        await _safe_reply(update, f"Generating training data from <code>{html.escape(file_rel_path)}</code>...")
+
+        from .ai.base import Message, Role
+
+        system_prompt = (
+            "You are a training data generator. Analyze the source code. "
+            "Output JSONL (one JSON object per line). Each object must have exactly two keys: "
+            '"instruction" (a natural-language coding task) and "output" (the code that solves it). '
+            "Output ONLY valid JSONL lines. No markdown fences. No explanations."
+        )
+        user_content = (
+            f"File: {file_rel_path}\n\n"
+            f"```\n{content}\n```\n\n"
+            "Generate instruction-output pairs as JSONL for fine-tuning a code model."
+        )
+
+        messages = [Message(role=Role.USER, content=user_content)]
+        response = await ollama.chat(
+            messages,
+            max_tokens=settings.data_mining_max_tokens,
+            temperature=0.3,
+            system_prompt=system_prompt,
+            timeout=settings.data_mining_timeout,
+            model=settings.qwen_coder_model,
+        )
+
+        result = response.content.strip()
+
+        if len(result) <= 4000:
+            await _safe_reply(update, f"<pre>{_sanitize_output(result)}</pre>")
+        else:
+            # Send as document to avoid Telegram message truncation
+            import tempfile
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", prefix="extract-", delete=False, encoding="utf-8",
+            ) as tmp:
+                tmp.write(result)
+                tmp_path = tmp.name
+
+            try:
+                await update.message.reply_document(  # type: ignore[union-attr]
+                    document=open(tmp_path, "rb"),
+                    filename=f"extract-{project_name}-{os.path.basename(file_rel_path)}.jsonl",
+                    caption=f"Training data from {file_rel_path} ({len(result)} chars)",
+                )
+            finally:
+                os.unlink(tmp_path)
+
+    except Exception:
+        logger.exception("/extract handler error")
+        await _safe_reply(update, "Error generating training data.")
+
+
 # ── /help ────────────────────────────────────────────────────────────────────
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1410,6 +1497,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/issues &lt;project&gt; — Open GitHub issues (with Solve buttons)\n"
         "/solve &lt;project&gt; &lt;#&gt; [#...] — Auto-solve issues via Claude\n"
         "/rebase &lt;project&gt; &lt;pr#&gt; — Rebase PR onto latest main\n"
+        "/extract &lt;project&gt; &lt;file&gt; — Generate training data from file\n"
         "\n"
         "/help — This message"
     )

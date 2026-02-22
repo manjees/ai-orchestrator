@@ -1,12 +1,15 @@
-"""Dual-Check Pipeline: DeepSeek Design → Claude Implement → Claude Review → DeepSeek Audit."""
+"""Triple-Model Pipeline: DeepSeek Design → Qwen Pre-Implement → Claude Implement → Claude Review → DeepSeek Audit → Data Mining."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from .ai.base import AIResponse, Message, Role
@@ -39,15 +42,18 @@ class PipelineContext:
     issue_body: str = ""
     issue_title: str = ""
     design_doc: str = ""
+    qwen_hints: str = ""
     git_diff: str = ""
     review_report: str = ""
     audit_result: str = ""
     audit_passed: bool = False
+    data_mining_result: str = ""
     retry_count: int = 0
     review_feedback: str = ""
     review_passed: bool = False
     steps: list[PipelineStep] = field(default_factory=lambda: [
         PipelineStep(name="DeepSeek Design"),
+        PipelineStep(name="Qwen Pre-Implement"),
         PipelineStep(name="Claude Implement"),
         PipelineStep(name="Claude Review"),
         PipelineStep(name="DeepSeek Audit"),
@@ -57,20 +63,18 @@ class PipelineContext:
 # ── Verdict Parsing ──────────────────────────────────────────────────────────
 
 def parse_verdict(text: str) -> bool | None:
-    """Extract [VERDICT: PASS] or [VERDICT: FAIL] from response tail."""
-    tail = text[-500:]
-    match = re.search(r"\[VERDICT:\s*(PASS|FAIL)\]", tail, re.IGNORECASE)
-    if match:
-        return match.group(1).upper() == "PASS"
+    """Extract [VERDICT: PASS] or [VERDICT: FAIL] from response (last match wins)."""
+    matches = list(re.finditer(r"\[VERDICT:\s*(PASS|FAIL)\]", text, re.IGNORECASE))
+    if matches:
+        return matches[-1].group(1).upper() == "PASS"
     return None
 
 
 def parse_final(text: str) -> bool | None:
-    """Extract [FINAL: APPROVED] or [FINAL: REJECTED] from response tail."""
-    tail = text[-500:]
-    match = re.search(r"\[FINAL:\s*(APPROVED|REJECTED)\]", tail, re.IGNORECASE)
-    if match:
-        return match.group(1).upper() == "APPROVED"
+    """Extract [FINAL: APPROVED] or [FINAL: REJECTED] from response (last match wins)."""
+    matches = list(re.finditer(r"\[FINAL:\s*(APPROVED|REJECTED)\]", text, re.IGNORECASE))
+    if matches:
+        return matches[-1].group(1).upper() == "APPROVED"
     return None
 
 
@@ -119,9 +123,9 @@ async def _capture_filtered_diff(project_path: str) -> str:
     return diff
 
 
-# ── DeepSeek Progress Helper ─────────────────────────────────────────────────
+# ── Ollama Progress Helper ───────────────────────────────────────────────────
 
-async def _call_deepseek_with_progress(
+async def _call_ollama_with_progress(
     ollama: OllamaProvider,
     messages: list[Message],
     *,
@@ -131,8 +135,9 @@ async def _call_deepseek_with_progress(
     timeout: int,
     progress_cb: ProgressCallback,
     step_name: str,
+    model: str | None = None,
 ) -> AIResponse:
-    """Call DeepSeek with periodic 'Thinking...' progress updates."""
+    """Call an Ollama model with periodic 'Thinking...' progress updates."""
     task = asyncio.create_task(
         ollama.chat(
             messages,
@@ -140,6 +145,7 @@ async def _call_deepseek_with_progress(
             temperature=temperature,
             system_prompt=system_prompt,
             timeout=timeout,
+            model=model,
         )
     )
     elapsed = 0
@@ -205,7 +211,7 @@ async def step_deepseek_design(
     messages = [Message(role=Role.USER, content=user_content)]
 
     try:
-        response = await _call_deepseek_with_progress(
+        response = await _call_ollama_with_progress(
             ollama, messages,
             max_tokens=settings.deepseek_design_max_tokens,
             temperature=0.7,
@@ -225,22 +231,78 @@ async def step_deepseek_design(
         step.elapsed_sec = time.monotonic() - start
 
 
+async def step_qwen_pre_implement(
+    ctx: PipelineContext,
+    ollama: OllamaProvider,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 1,
+) -> None:
+    """Step 1.5: Qwen2.5-Coder generates implementation hints (code-only, non-fatal)."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    system_prompt = (
+        "You are a code generation assistant. "
+        "No explanations. Output ONLY: file paths, code snippets, function signatures, "
+        "and import statements. Be maximally concise."
+    )
+    user_content = (
+        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
+        f"--- Design Guide ---\n{ctx.design_doc}\n---\n\n"
+        "Generate the implementation code for the above design. "
+        "Output ONLY code: file paths, code snippets, function signatures, and imports."
+    )
+
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    try:
+        response = await _call_ollama_with_progress(
+            ollama, messages,
+            max_tokens=settings.data_mining_max_tokens,
+            temperature=0.4,
+            system_prompt=system_prompt,
+            timeout=settings.qwen_impl_timeout,
+            progress_cb=progress_cb,
+            step_name="Qwen Pre-Implement",
+            model=settings.qwen_coder_model,
+        )
+        ctx.qwen_hints = response.content
+        step.status = "passed"
+        step.detail = f"{response.output_tokens} tokens"
+    except Exception as exc:
+        step.status = "skipped"
+        step.detail = f"Non-fatal: {str(exc)[:150]}"
+        logger.warning("Qwen pre-implement failed (non-fatal): %s", exc)
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
 async def step_claude_implement(
     ctx: PipelineContext,
     settings: Settings,
     cancel_event: asyncio.Event,
     progress_cb: ProgressCallback,
-    step_index: int = 1,
+    step_index: int = 2,
 ) -> None:
-    """Step 2: Claude CLI implements based on DeepSeek's design."""
+    """Step 2: Claude CLI implements based on DeepSeek's design and Qwen's hints."""
     step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
 
+    qwen_section = ""
+    if ctx.qwen_hints:
+        qwen_section = (
+            f"\n\n--- Code Suggestions (from Qwen2.5-Coder) ---\n{ctx.qwen_hints}\n---\n"
+            f"Use the above code suggestions as a starting reference.\n"
+        )
+
     prompt = (
         f"Read .claude/CLAUDE.md first and follow the defined pipeline. "
         f"Then read GitHub issue #{ctx.issue_num} with `gh issue view {ctx.issue_num}`. "
-        f"\n\n--- Design Guide (from DeepSeek) ---\n{ctx.design_doc}\n---\n\n"
+        f"\n\n--- Design Guide (from DeepSeek) ---\n{ctx.design_doc}\n---\n"
+        f"{qwen_section}\n"
         f"Implement the solution following this design guide. "
         f"IMPORTANT: After implementation, you MUST run the project's compile/build command "
         f"to verify there are no compilation errors before finishing. "
@@ -348,7 +410,8 @@ async def step_claude_review(
     ctx: PipelineContext,
     anthropic: AnthropicProvider | None,
     settings: Settings,
-    step_index: int = 2,
+    progress_cb: ProgressCallback | None = None,
+    step_index: int = 3,
 ) -> None:
     """Step 3: Claude reviews the implementation via Anthropic API (or CLI fallback)."""
     step = ctx.steps[step_index]
@@ -368,8 +431,21 @@ async def step_claude_review(
         f"4. Are there any regressions?\n\n"
         f"After your review, you MUST end with exactly one of:\n"
         f"[VERDICT: PASS] — if the implementation is acceptable\n"
-        f"[VERDICT: FAIL] — if there are critical issues"
+        f"[VERDICT: FAIL] — if there are critical issues\n\n"
+        f"IMPORTANT: [VERDICT: ...] must be the VERY LAST line of your response. "
+        f"Do not write anything after the verdict tag."
     )
+
+    # Periodic progress updates while review is running
+    async def _tick() -> None:
+        while True:
+            await asyncio.sleep(15)
+            if progress_cb:
+                elapsed = int(time.monotonic() - start)
+                mins, secs = divmod(elapsed, 60)
+                await progress_cb(f"[3/5] Claude Review [{mins}m {secs}s]...")
+
+    tick_task = asyncio.create_task(_tick())
 
     try:
         if anthropic:
@@ -383,7 +459,9 @@ async def step_claude_review(
             review_text = response.content
         else:
             # Fallback: Claude CLI
-            review_text = await _claude_cli_review(ctx.project_path, review_prompt)
+            review_text = await _claude_cli_review(
+                ctx.project_path, review_prompt, timeout=settings.claude_review_timeout,
+            )
 
         ctx.review_report = review_text
         verdict = parse_verdict(review_text)
@@ -414,8 +492,9 @@ async def step_claude_review(
         ctx.review_passed = False
         step.status = "failed"
         step.detail = str(exc)[:200]
-        raise
+        logger.warning("Claude review error for issue #%d: %s", ctx.issue_num, exc)
     finally:
+        tick_task.cancel()
         step.elapsed_sec = time.monotonic() - start
 
 
@@ -452,7 +531,7 @@ async def step_deepseek_audit(
     messages = [Message(role=Role.USER, content=user_content)]
 
     try:
-        response = await _call_deepseek_with_progress(
+        response = await _call_ollama_with_progress(
             ollama, messages,
             max_tokens=settings.deepseek_audit_max_tokens,
             temperature=0.3,
@@ -487,6 +566,104 @@ async def step_deepseek_audit(
         step.elapsed_sec = time.monotonic() - start
 
 
+# ── Data Mining ──────────────────────────────────────────────────────────────
+
+async def step_data_mining(
+    ctx: PipelineContext,
+    ollama: OllamaProvider,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = -1,
+) -> None:
+    """Step 5: Qwen generates training data from the successful solve (non-fatal)."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    system_prompt = (
+        "You are a training data generator. Analyze the code diff and issue context. "
+        "Output JSONL (one JSON object per line). Each object must have exactly two keys: "
+        '"instruction" (a natural-language coding task) and "output" (the code that solves it). '
+        "Output ONLY valid JSONL lines. No markdown fences. No explanations."
+    )
+    user_content = (
+        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
+        f"--- Git Diff ---\n{ctx.git_diff}\n\n"
+        "Generate instruction-output pairs as JSONL for fine-tuning a code model."
+    )
+
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    try:
+        response = await _call_ollama_with_progress(
+            ollama, messages,
+            max_tokens=settings.data_mining_max_tokens,
+            temperature=0.3,
+            system_prompt=system_prompt,
+            timeout=settings.data_mining_timeout,
+            progress_cb=progress_cb,
+            step_name="Data Mining",
+            model=settings.qwen_coder_model,
+        )
+        ctx.data_mining_result = response.content
+        valid, dropped = _write_training_data(ctx, settings)
+        step.status = "passed"
+        step.detail = f"{valid} pairs saved, {dropped} dropped"
+    except Exception as exc:
+        step.status = "skipped"
+        step.detail = f"Non-fatal: {str(exc)[:150]}"
+        logger.warning("Data mining failed (non-fatal): %s", exc)
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+def _write_training_data(ctx: PipelineContext, settings: Settings) -> tuple[int, int]:
+    """Write JSONL training data to disk. Returns (valid_count, dropped_count)."""
+    raw = ctx.data_mining_result
+    if not raw.strip():
+        return 0, 0
+
+    # Resolve output directory
+    if settings.training_data_dir:
+        out_dir = Path(settings.training_data_dir)
+    else:
+        out_dir = Path(__file__).parent.parent / "data" / "training" / ctx.project_name
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Strip markdown code fences that LLMs often wrap JSONL in
+    cleaned = re.sub(r"```(?:json|jsonl)?\s*\n?", "", raw)
+    cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE)
+
+    valid_lines: list[str] = []
+    dropped = 0
+    for line in cleaned.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if "instruction" in obj and "output" in obj:
+                valid_lines.append(json.dumps(obj, ensure_ascii=False))
+            else:
+                dropped += 1
+        except json.JSONDecodeError:
+            dropped += 1
+
+    if not valid_lines:
+        return 0, dropped
+
+    timestamp = int(time.time())
+    filename = f"issue-{ctx.issue_num}-{timestamp}.jsonl"
+    filepath = out_dir / filename
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(valid_lines) + "\n")
+
+    logger.info("Training data written: %s (%d valid, %d dropped)", filepath, len(valid_lines), dropped)
+    return len(valid_lines), dropped
+
+
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 async def run_dual_check_pipeline(
@@ -497,7 +674,7 @@ async def run_dual_check_pipeline(
     cancel_event: asyncio.Event,
     progress_cb: ProgressCallback,
 ) -> tuple[str, str]:
-    """Run the full 4-step pipeline with automatic retry on review failure. Returns (status, detail)."""
+    """Run the full 5-step pipeline with automatic retry on review failure. Returns (status, detail)."""
     max_retries = settings.max_review_retries
 
     try:
@@ -509,8 +686,18 @@ async def run_dual_check_pipeline(
             return "skipped", "Cancelled by user"
 
         # Step 1: DeepSeek Design (once)
-        await progress_cb("[1/4] DeepSeek Design...")
+        await progress_cb("[1/5] DeepSeek Design...")
         await step_deepseek_design(ctx, ollama, settings, progress_cb)
+
+        if cancel_event.is_set():
+            return "skipped", "Cancelled by user"
+
+        # Step 1.5: Qwen Pre-Implement (non-fatal)
+        try:
+            await progress_cb("[1.5/5] Qwen Pre-Implement...")
+            await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=1)
+        except Exception as exc:
+            logger.warning("Qwen pre-implement step failed (non-fatal): %s", exc)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
@@ -528,20 +715,20 @@ async def run_dual_check_pipeline(
                 ctx.steps.insert(-1, PipelineStep(name=f"Claude Implement (retry {attempt})"))
                 ctx.steps.insert(-1, PipelineStep(name=f"Claude Review (retry {attempt})"))
 
-            step_idx_impl = 1 + (attempt * 2)
-            step_idx_review = 2 + (attempt * 2)
+            step_idx_impl = 2 + (attempt * 2)
+            step_idx_review = 3 + (attempt * 2)
 
             # Step 2: Claude Implement
             attempt_label = f" (retry {attempt})" if attempt > 0 else ""
-            await progress_cb(f"[2/4] Claude Implement{attempt_label}...")
+            await progress_cb(f"[2/5] Claude Implement{attempt_label}...")
             await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=step_idx_impl)
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
 
             # Step 3: Claude Review
-            await progress_cb(f"[3/4] Claude Review{attempt_label}...")
-            await step_claude_review(ctx, anthropic, settings, step_index=step_idx_review)
+            await progress_cb(f"[3/5] Claude Review{attempt_label}...")
+            await step_claude_review(ctx, anthropic, settings, progress_cb=progress_cb, step_index=step_idx_review)
 
             if ctx.review_passed:
                 break
@@ -558,9 +745,18 @@ async def run_dual_check_pipeline(
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 4: DeepSeek Audit (always last step)
-        await progress_cb("[4/4] DeepSeek Audit...")
+        # Step 4: DeepSeek Audit (always last non-mining step)
+        await progress_cb("[4/5] DeepSeek Audit...")
         await step_deepseek_audit(ctx, ollama, settings, progress_cb, step_index=-1)
+
+        # Step 5: Data Mining (conditional, non-fatal)
+        if settings.enable_data_mining and ctx.audit_passed:
+            ctx.steps.append(PipelineStep(name="Data Mining"))
+            try:
+                await progress_cb("[5/5] Data Mining...")
+                await step_data_mining(ctx, ollama, settings, progress_cb, step_index=-1)
+            except Exception as exc:
+                logger.warning("Data mining step failed (non-fatal): %s", exc)
 
         return "success", "All checks passed"
 
@@ -615,7 +811,7 @@ async def _reset_worktree(project_path: str) -> None:
     await asyncio.wait_for(proc.communicate(), timeout=15)
 
 
-async def _claude_cli_review(project_path: str, prompt: str) -> str:
+async def _claude_cli_review(project_path: str, prompt: str, timeout: int = 900) -> str:
     """Run Claude CLI for review, passing prompt via stdin to avoid shell length limits."""
     proc = await asyncio.create_subprocess_exec(
         "claude", "-p", "--output-format", "text",
@@ -625,7 +821,7 @@ async def _claude_cli_review(project_path: str, prompt: str) -> str:
         cwd=project_path,
     )
     stdout, stderr = await asyncio.wait_for(
-        proc.communicate(input=prompt.encode()), timeout=300,
+        proc.communicate(input=prompt.encode()), timeout=timeout,
     )
     output = stdout.decode(errors="replace") if stdout else ""
     if proc.returncode != 0:

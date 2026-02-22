@@ -30,15 +30,24 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     cmd_timeout: int = 30
     cmd_long_timeout: int = 600
-    solve_timeout: int = 1800  # per-issue timeout (30 min)
+    solve_timeout: int = 3600  # per-issue timeout (60 min)
 
     # Dual-Check System
     dual_check_enabled: bool = True
     deepseek_design_timeout: int = 600   # Step 1: 10 min
+    claude_review_timeout: int = 900     # Step 3: 15 min
     deepseek_audit_timeout: int = 600    # Step 4: 10 min
     deepseek_design_max_tokens: int = 8192
     deepseek_audit_max_tokens: int = 4096
     max_review_retries: int = 2
+
+    # Triple-Model Hybrid (Qwen Coder)
+    qwen_coder_model: str = "qwen2.5-coder:32b"
+    enable_data_mining: bool = True
+    qwen_impl_timeout: int = 600          # Step 2: Qwen pre-impl (10 min)
+    data_mining_timeout: int = 300         # Step 5: training data gen (5 min)
+    data_mining_max_tokens: int = 4096
+    training_data_dir: str = ""            # Empty = default to ai-orchestrator/data/training/
 
 
 def load_projects() -> dict[str, dict]:

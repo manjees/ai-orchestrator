@@ -11,12 +11,15 @@ Telegram  ──>  Bot (python-telegram-bot)
                 ├── tmux Viewer
                 ├── Service Controller (launchd)
                 └── AI Pipeline
-                    ├── /solve  ──>  Dual-Check Pipeline
+                    ├── /solve  ──>  Triple-Model Pipeline
                     │                ├── DeepSeek Design (Ollama)
+                    │                ├── Qwen Pre-Implement (Ollama)
                     │                ├── Claude Implement (CLI)
                     │                ├── Claude Review (API)
-                    │                └── DeepSeek Audit (Ollama)
-                    └── /rebase ──>  Auto conflict resolution (Claude CLI)
+                    │                ├── DeepSeek Audit (Ollama)
+                    │                └── Data Mining (Ollama, conditional)
+                    ├── /extract ──>  Training data generation (Qwen)
+                    └── /rebase  ──>  Auto conflict resolution (Claude CLI)
 ```
 
 ## Features
@@ -29,19 +32,26 @@ Telegram  ──>  Bot (python-telegram-bot)
 
 ### AI-Powered Development
 - `/issues <project>` — List open GitHub issues with inline Solve buttons
-- `/solve <project> <#> [#...]` — Auto-solve issues with a 4-step dual-check pipeline
+- `/solve <project> <#> [#...]` — Auto-solve issues with a 5-step triple-model pipeline
 - `/rebase <project> <pr#>` — Rebase PR onto main, auto-resolve conflicts with Claude
+- `/extract <project> <file>` — Generate JSONL training data from a source file
 
-### Dual-Check Pipeline (`/solve`)
+### Triple-Model Pipeline (`/solve`)
 
-A 4-step quality gate that uses two different AI models to cross-check each other:
+A 5-step quality gate that uses three AI models (DeepSeek R1, Qwen2.5-Coder, Claude) to cross-check each other:
 
-1. **DeepSeek Design** (Ollama, local) — Analyzes the issue and creates an implementation plan
-2. **Claude Implement** (Claude CLI) — Implements the solution following the design
-3. **Claude Review** (Anthropic API) — Code review with PASS/FAIL verdict; auto-retries on FAIL
-4. **DeepSeek Audit** (Ollama, local) — Final audit with APPROVED/REJECTED verdict
+1. **DeepSeek Design** (Ollama) — Analyzes the issue and creates an implementation plan
+2. **Qwen Pre-Implement** (Ollama) — Generates code-only implementation hints for Claude
+3. **Claude Implement** (CLI) — Implements the solution using the design + Qwen hints
+4. **Claude Review** (Anthropic API) — Code review with PASS/FAIL verdict; auto-retries on FAIL
+5. **DeepSeek Audit** (Ollama) — Final audit with APPROVED/REJECTED verdict
+6. **Data Mining** (Ollama, conditional) — On success, generates JSONL training pairs from the solve
 
-Each issue runs in an isolated **git worktree**, enabling parallel solves without interference.
+Steps 2 and 6 are non-fatal — the pipeline continues if they fail. Each issue runs in an isolated **git worktree**, enabling parallel solves.
+
+### Training Data (`/extract`)
+
+Generate instruction-output JSONL pairs from any source file using Qwen2.5-Coder. Results under 4KB are sent inline; larger outputs are sent as downloadable `.jsonl` files.
 
 ### PR Rebase (`/rebase`)
 
@@ -53,7 +63,7 @@ Automatically rebases a PR branch onto `main`. When conflicts occur, Claude CLI 
 - **python-telegram-bot** — Telegram Bot API framework
 - **Claude CLI** — Agentic code generation and conflict resolution
 - **Anthropic API** — Direct API calls for code review
-- **Ollama** — Local LLM inference (DeepSeek R1)
+- **Ollama** — Local LLM inference (DeepSeek R1, Qwen2.5-Coder-32B)
 - **psutil** — Cross-platform system monitoring
 - **Git worktrees** — Isolated parallel workspaces
 - **launchd** — macOS service management
@@ -65,7 +75,7 @@ Automatically rebases a PR branch onto `main`. When conflicts occur, Claude CLI 
 - Python 3.11+, [uv](https://github.com/astral-sh/uv)
 - [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed
 - [GitHub CLI](https://cli.github.com/) (`gh`) authenticated
-- [Ollama](https://ollama.ai) (optional, for dual-check pipeline)
+- [Ollama](https://ollama.ai) with DeepSeek R1 and Qwen2.5-Coder-32B models
 
 ### Install
 
@@ -104,7 +114,7 @@ orchestrator/
 ├── bot.py               # Telegram app factory & handler registration
 ├── config.py            # Pydantic settings (.env)
 ├── handlers.py          # Command handlers (/status, /cmd, /solve, /rebase, ...)
-├── pipeline.py          # Dual-check pipeline (DeepSeek ↔ Claude)
+├── pipeline.py          # Triple-model pipeline (DeepSeek ↔ Qwen ↔ Claude)
 ├── security.py          # Auth filter & secret masking
 ├── system_monitor.py    # CPU, RAM, Disk, Thermal via psutil
 ├── tmux_manager.py      # tmux session capture

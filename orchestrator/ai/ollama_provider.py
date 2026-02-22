@@ -35,7 +35,10 @@ class OllamaProvider(AIProvider):
         temperature: float = 0.7,
         system_prompt: str | None = None,
         timeout: int | None = None,
+        model: str | None = None,
     ) -> AIResponse:
+        effective_model = model or self._model
+
         payload_messages: list[dict[str, str]] = []
         if system_prompt:
             payload_messages.append({"role": Role.SYSTEM.value, "content": system_prompt})
@@ -43,7 +46,7 @@ class OllamaProvider(AIProvider):
             payload_messages.append({"role": msg.role.value, "content": msg.content})
 
         payload: dict[str, Any] = {
-            "model": self._model,
+            "model": effective_model,
             "messages": payload_messages,
             "stream": False,
             "options": {
@@ -68,7 +71,7 @@ class OllamaProvider(AIProvider):
 
         return AIResponse(
             content=data.get("message", {}).get("content", ""),
-            model=data.get("model", self._model),
+            model=data.get("model", effective_model),
             input_tokens=data.get("prompt_eval_count", 0),
             output_tokens=data.get("eval_count", 0),
             finish_reason=data.get("done_reason", ""),
