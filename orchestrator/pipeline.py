@@ -41,6 +41,7 @@ class PipelineContext:
     branch_name: str
     issue_body: str = ""
     issue_title: str = ""
+    base_commit: str = ""  # HEAD hash at worktree creation (before Claude runs)
     design_doc: str = ""
     qwen_hints: str = ""
     git_diff: str = ""
@@ -90,12 +91,13 @@ DIFF_EXCLUDE_PATTERNS = [
 _MAX_DIFF_CHARS = 50_000
 
 
-async def _capture_filtered_diff(project_path: str) -> str:
-    """Capture git diff main..HEAD excluding binary/generated files."""
+async def _capture_filtered_diff(project_path: str, base_ref: str = "main") -> str:
+    """Capture git diff base_ref..HEAD excluding binary/generated files."""
+    diff_range = f"{base_ref}..HEAD"
     exclude_args = [f":(exclude){pat}" for pat in DIFF_EXCLUDE_PATTERNS]
 
     proc = await asyncio.create_subprocess_exec(
-        "git", "diff", "main..HEAD", "--", ".", *exclude_args,
+        "git", "diff", diff_range, "--", ".", *exclude_args,
         cwd=project_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -106,7 +108,7 @@ async def _capture_filtered_diff(project_path: str) -> str:
     if len(diff) > _MAX_DIFF_CHARS:
         # Capture stat summary as fallback context
         stat_proc = await asyncio.create_subprocess_exec(
-            "git", "diff", "main..HEAD", "--stat",
+            "git", "diff", diff_range, "--stat",
             cwd=project_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -386,7 +388,9 @@ async def step_claude_implement(
         await _snapshot_commit(ctx.project_path, ctx.issue_num)
 
         # Capture filtered diff
-        ctx.git_diff = await _capture_filtered_diff(ctx.project_path)
+        ctx.git_diff = await _capture_filtered_diff(
+            ctx.project_path, base_ref=ctx.base_commit or "main",
+        )
 
         if not ctx.git_diff.strip():
             step.status = "failed"

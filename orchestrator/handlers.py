@@ -29,7 +29,7 @@ _MONITORED_PROCESSES = {"ollama", "python", "node"}
 
 # Active solve sessions: chat_id → {issue_num → asyncio.Event}
 _solve_cancels: dict[int, dict[int, asyncio.Event]] = {}
-_solve_active: set[int] = set()
+_solve_active: dict[int, int] = {}  # chat_id → number of active solve sessions
 
 # ANSI escape codes: CSI sequences (incl. ?/= private modes), OSC sequences, single ESC codes
 _ANSI_RE = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^[\]()]")
@@ -641,19 +641,23 @@ async def _start_solve(
     *,
     from_callback: bool = False,
 ) -> None:
-    """Guard concurrent runs and launch the solve loop."""
-    if chat_id in _solve_active:
-        msg = "A solve session is already running. Use Cancel to stop it first."
+    """Guard duplicate issues and launch the solve loop."""
+    # Block only if the same issue is already running
+    existing = _solve_cancels.get(chat_id, {})
+    duplicates = [num for num in issue_nums if num in existing]
+    if duplicates:
+        dup_str = ", ".join(f"#{n}" for n in duplicates)
+        msg = f"Already running: {dup_str}. Use Cancel to stop first."
         if from_callback:
             await context.bot.send_message(chat_id, msg)
         else:
             await _safe_reply(update, msg)
         return
 
-    _solve_active.add(chat_id)
-    # Create per-issue cancel events
+    _solve_active[chat_id] = _solve_active.get(chat_id, 0) + 1
+    # Merge per-issue cancel events (don't overwrite existing)
     cancel_events = {num: asyncio.Event() for num in issue_nums}
-    _solve_cancels[chat_id] = cancel_events
+    _solve_cancels.setdefault(chat_id, {}).update(cancel_events)
 
     projects: dict = context.bot_data.get("projects", {})
     project_path = projects[project_name]["path"]
@@ -722,8 +726,17 @@ async def _solve_issues(
     except Exception:
         logger.exception("Solve loop error")
     finally:
-        _solve_active.discard(chat_id)
-        _solve_cancels.pop(chat_id, None)
+        # Decrement active count; remove only this batch's cancel events
+        count = _solve_active.get(chat_id, 1) - 1
+        if count <= 0:
+            _solve_active.pop(chat_id, None)
+        else:
+            _solve_active[chat_id] = count
+        events = _solve_cancels.get(chat_id, {})
+        for num in issue_nums:
+            events.pop(num, None)
+        if not events:
+            _solve_cancels.pop(chat_id, None)
 
     # Summary message
     lines = [f"<b>Solve Summary — {html.escape(project_name)}</b>"]
@@ -805,6 +818,16 @@ async def _solve_with_dual_check(
 
         worktree_dir = git_result  # on success, this is the worktree path
 
+        # Capture base commit for accurate diffing (only this session's changes)
+        base_proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "HEAD",
+            cwd=worktree_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        base_out, _ = await asyncio.wait_for(base_proc.communicate(), timeout=5)
+        base_commit = base_out.decode().strip() if base_out else ""
+
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
@@ -814,6 +837,7 @@ async def _solve_with_dual_check(
             project_name=project_name,
             issue_num=issue_num,
             branch_name=branch_name,
+            base_commit=base_commit,
         )
 
         # Progress callback: update Telegram message
