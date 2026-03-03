@@ -58,6 +58,27 @@ _discuss_results: dict[int, dict] = {}
 _ANSI_RE = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^[\]()]")
 
 
+def _resolve_project(name: str, projects: dict[str, dict]) -> tuple[str | None, str]:
+    """Resolve project name with prefix matching.
+
+    Returns (resolved_name, error_message).
+    If resolved_name is None, error_message explains why.
+    """
+    # Exact match first
+    if name in projects:
+        return name, ""
+
+    # Prefix match
+    matches = [p for p in projects if p.startswith(name)]
+    if len(matches) == 1:
+        return matches[0], ""
+    if len(matches) > 1:
+        names = ", ".join(f"<code>{html.escape(m)}</code>" for m in sorted(matches))
+        return None, f"Ambiguous project: {names}"
+
+    return None, f"Unknown project: <code>{html.escape(name)}</code>"
+
+
 def _sanitize_output(text: str) -> str:
     """Strip ANSI escape codes, control characters, then HTML-escape."""
     text = _ANSI_RE.sub("", text)
@@ -520,11 +541,11 @@ async def issues_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _safe_reply(update, "Usage: <code>/issues &lt;project&gt;</code>")
             return
 
-        project_name = context.args[0]
-        projects: dict = context.bot_data.get("projects", {})
-        if project_name not in projects:
-            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+        project_name, err = _resolve_project(context.args[0], context.bot_data.get("projects", {}))
+        if project_name is None:
+            await _safe_reply(update, err)
             return
+        projects: dict = context.bot_data.get("projects", {})
 
         project_path = projects[project_name]["path"]
         proc = await asyncio.create_subprocess_exec(
@@ -588,11 +609,11 @@ async def solve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await _safe_reply(update, "Usage: <code>/solve &lt;project&gt; &lt;issue#&gt; [issue#] ...</code>")
             return
 
-        project_name = context.args[0]
-        projects: dict = context.bot_data.get("projects", {})
-        if project_name not in projects:
-            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+        project_name, err = _resolve_project(context.args[0], context.bot_data.get("projects", {}))
+        if project_name is None:
+            await _safe_reply(update, err)
             return
+        projects: dict = context.bot_data.get("projects", {})
 
         # Parse issue numbers
         issue_nums: list[int] = []
@@ -1394,11 +1415,11 @@ async def rebase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _safe_reply(update, "Usage: <code>/rebase &lt;project&gt; &lt;pr#&gt;</code>")
             return
 
-        project_name = context.args[0]
-        projects: dict = context.bot_data.get("projects", {})
-        if project_name not in projects:
-            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+        project_name, err = _resolve_project(context.args[0], context.bot_data.get("projects", {}))
+        if project_name is None:
+            await _safe_reply(update, err)
             return
+        projects: dict = context.bot_data.get("projects", {})
 
         try:
             pr_number = int(context.args[1])
@@ -1605,13 +1626,12 @@ async def extract_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _safe_reply(update, "Usage: <code>/extract &lt;project&gt; &lt;file_path&gt;</code>")
             return
 
-        project_name = context.args[0]
-        file_rel_path = " ".join(context.args[1:])
-
-        projects: dict = context.bot_data.get("projects", {})
-        if project_name not in projects:
-            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+        project_name, err = _resolve_project(context.args[0], context.bot_data.get("projects", {}))
+        if project_name is None:
+            await _safe_reply(update, err)
             return
+        projects: dict = context.bot_data.get("projects", {})
+        file_rel_path = " ".join(context.args[1:])
 
         project_path = projects[project_name]["path"]
         file_path = os.path.join(project_path, file_rel_path)
@@ -1960,16 +1980,15 @@ async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await _safe_reply(update, "Usage: <code>/plan &lt;project&gt;</code>")
             return
 
-        project_name = context.args[0]
+        project_name, err = _resolve_project(context.args[0], context.bot_data.get("projects", {}))
+        if project_name is None:
+            await _safe_reply(update, err)
+            return
+        projects: dict = context.bot_data.get("projects", {})
         settings: Settings = context.bot_data["settings"]
 
         if not settings.github_user:
             await _safe_reply(update, "GITHUB_USER is not set in .env")
-            return
-
-        projects: dict = context.bot_data.get("projects", {})
-        if project_name not in projects:
-            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
             return
 
         chat_id = update.effective_chat.id  # type: ignore[union-attr]
@@ -2157,13 +2176,12 @@ async def discuss_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        project_name = context.args[0]
-        question = " ".join(context.args[1:])
-
-        projects: dict = context.bot_data.get("projects", {})
-        if project_name not in projects:
-            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+        project_name, err = _resolve_project(context.args[0], context.bot_data.get("projects", {}))
+        if project_name is None:
+            await _safe_reply(update, err)
             return
+        projects: dict = context.bot_data.get("projects", {})
+        question = " ".join(context.args[1:])
 
         chat_id = update.effective_chat.id  # type: ignore[union-attr]
 
