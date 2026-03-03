@@ -340,10 +340,16 @@ async def process_callback_handler(
 
 # ── /service ─────────────────────────────────────────────────────────────────
 
-_LAUNCHD_LABEL = "com.ai-orchestrator"
-_PLIST_PATH = os.path.expanduser(
-    f"~/Library/LaunchAgents/{_LAUNCHD_LABEL}.plist"
-)
+def _get_launchd_label(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Return launchd label from settings, falling back to default."""
+    try:
+        return context.bot_data["settings"].launchd_label
+    except (KeyError, AttributeError):
+        return "com.ai-orchestrator"
+
+
+def _get_plist_path(label: str) -> str:
+    return os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
 
 
 async def service_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -352,15 +358,15 @@ async def service_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sub = (context.args[0].lower() if context.args else "").strip()
 
         if sub == "status":
-            await _svc_status(update)
+            await _svc_status(update, context)
         elif sub == "restart":
-            await _svc_restart(update)
+            await _svc_restart(update, context)
         elif sub == "stop":
-            await _svc_stop(update)
+            await _svc_stop(update, context)
         elif sub == "start":
-            await _svc_start(update)
+            await _svc_start(update, context)
         elif sub == "logs":
-            await _svc_logs(update, context)
+            await _svc_logs(update, context, _get_launchd_label(context))
         else:
             await _safe_reply(
                 update,
@@ -393,8 +399,9 @@ async def _run_launchctl(*args: str) -> tuple[int, str]:
         return 1, "(launchctl not found)"
 
 
-async def _svc_status(update: Update) -> None:
-    rc, output = await _run_launchctl("list", _LAUNCHD_LABEL)
+async def _svc_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    label = _get_launchd_label(context)
+    rc, output = await _run_launchctl("list", label)
     if rc != 0:
         await _safe_reply(update, f"Service not loaded\n<pre>{html.escape(output)}</pre>")
         return
@@ -417,27 +424,30 @@ async def _svc_status(update: Update) -> None:
     await _safe_reply(update, "\n".join(lines))
 
 
-async def _svc_restart(update: Update) -> None:
+async def _svc_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    label = _get_launchd_label(context)
     uid = os.getuid()
     await _safe_reply(update, "Restarting bot...")
-    await _run_launchctl("kickstart", "-k", f"gui/{uid}/{_LAUNCHD_LABEL}")
+    await _run_launchctl("kickstart", "-k", f"gui/{uid}/{label}")
 
 
-async def _svc_stop(update: Update) -> None:
+async def _svc_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    plist = _get_plist_path(_get_launchd_label(context))
     await _safe_reply(update, "Stopping bot... (KeepAlive will NOT restart)")
     # unload prevents KeepAlive from restarting the process
-    await _run_launchctl("unload", _PLIST_PATH)
+    await _run_launchctl("unload", plist)
 
 
-async def _svc_start(update: Update) -> None:
-    rc, output = await _run_launchctl("load", _PLIST_PATH)
+async def _svc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    plist = _get_plist_path(_get_launchd_label(context))
+    rc, output = await _run_launchctl("load", plist)
     if rc == 0:
         await _safe_reply(update, "Service loaded and starting.")
     else:
         await _safe_reply(update, f"Failed to start:\n<pre>{html.escape(output)}</pre>")
 
 
-async def _svc_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _svc_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, _label: str = "") -> None:
     log_type = "stderr"
     if context.args and len(context.args) > 1:
         log_type = context.args[1].lower()
