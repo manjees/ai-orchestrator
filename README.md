@@ -40,7 +40,7 @@ Telegram  ──>  Bot (python-telegram-bot)
 - `/service` — launchd service control (start/stop/restart/logs)
 
 ### AI-Powered Development
-- `/init <name> <description>` — Bootstrap a new project (stack research → scaffold → GitHub → issues)
+- `/init [--public|--private] <name> <description>` — Bootstrap a new project (stack research → scaffold → GitHub → issues)
 - `/issues <project>` — List open GitHub issues with inline Solve buttons
 - `/solve <project> <#> [#...]` — Auto-solve issues via configurable pipeline
 - `/rebase <project> <pr#>` — Rebase PR onto main, auto-resolve conflicts with Claude
@@ -49,8 +49,8 @@ Telegram  ──>  Bot (python-telegram-bot)
 ### Typical Workflow
 
 ```
-/init my-app A KMP mobile app for task management
-  → Stack Scout → CLAUDE.md → Scaffold + GitHub repo → 7 issues created
+/init --public my-app A KMP mobile app for task management
+  → Stack Scout → CLAUDE.md → Scaffold + GitHub repo (public) → 7 issues created
   → projects.json auto-registered
 
 /issues my-app
@@ -67,7 +67,7 @@ Telegram  ──>  Bot (python-telegram-bot)
 A 4-step pipeline that bootstraps a new project end-to-end using only Claude CLI models (no Ollama required):
 
 ```
-/init my-app A KMP mobile app for task management
+/init [--public|--private] my-app A KMP mobile app for task management
 
 Step 0: [Haiku]   Stack Scout — tech stack + latest versions
 Step 1: [Opus]    Architecting — CLAUDE.md + agents.md generation

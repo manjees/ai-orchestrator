@@ -1667,18 +1667,29 @@ _PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 async def init_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bootstrap a new project: /init <project_name> <description...>"""
+    """Bootstrap a new project: /init [--public|--private] <project_name> <description...>"""
     try:
         if not context.args or len(context.args) < 2:
             await _safe_reply(
                 update,
-                "Usage: <code>/init &lt;project_name&gt; &lt;description&gt;</code>\n"
-                "Example: <code>/init my-app A KMP mobile app for task management</code>",
+                "Usage: <code>/init [--public|--private] &lt;name&gt; &lt;description&gt;</code>\n"
+                "Example: <code>/init --public my-app A KMP mobile app</code>",
             )
             return
 
-        project_name = context.args[0]
-        description = " ".join(context.args[1:])
+        args = list(context.args)
+
+        # Parse --public / --private flag
+        visibility_override: str | None = None
+        if args[0] in ("--public", "--private"):
+            visibility_override = args.pop(0).lstrip("-")  # "public" or "private"
+
+        if len(args) < 2:
+            await _safe_reply(update, "Missing project name or description.")
+            return
+
+        project_name = args[0]
+        description = " ".join(args[1:])
 
         # Validate project name
         if not _PROJECT_NAME_RE.match(project_name):
@@ -1714,14 +1725,17 @@ async def init_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         cancel_event = asyncio.Event()
         _init_cancels[chat_id] = cancel_event
 
+        visibility = visibility_override or settings.default_repo_visibility
+
         # Background task
         asyncio.create_task(
-            _run_init(context, chat_id, project_name, description, project_path, settings, cancel_event)
+            _run_init(context, chat_id, project_name, description, project_path, settings, cancel_event, visibility)
         )
 
+        vis_label = f" ({visibility})" if visibility_override else ""
         await _safe_reply(
             update,
-            f"Bootstrapping <b>{html.escape(project_name)}</b>...\n"
+            f"Bootstrapping <b>{html.escape(project_name)}</b>{vis_label}...\n"
             f"<i>{html.escape(description)}</i>",
         )
     except Exception:
@@ -1782,6 +1796,7 @@ async def _run_init(
     project_path: str,
     settings,
     cancel_event: asyncio.Event,
+    visibility: str = "private",
 ) -> None:
     """Background task that runs the 4-step init pipeline."""
     cancel_btn = InlineKeyboardMarkup([
@@ -1806,7 +1821,7 @@ async def _run_init(
             description=description,
             project_path=project_path,
             github_user=settings.github_user,
-            repo_visibility=settings.default_repo_visibility,
+            repo_visibility=visibility,
         )
 
         async def progress_cb(status_text: str) -> None:
@@ -1921,7 +1936,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/service — Service control (status/restart/stop/start/logs)\n"
         "\n"
         "/projects — List registered projects\n"
-        "/init &lt;name&gt; &lt;description&gt; — Bootstrap a new project\n"
+        "/init [--public] &lt;name&gt; &lt;desc&gt; — Bootstrap a new project\n"
         "/issues &lt;project&gt; — Open GitHub issues (with Solve buttons)\n"
         "/solve &lt;project&gt; &lt;#&gt; [#...] — Auto-solve issues via Claude\n"
         "/rebase &lt;project&gt; &lt;pr#&gt; — Rebase PR onto latest main\n"
