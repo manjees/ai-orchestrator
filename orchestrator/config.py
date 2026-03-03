@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     default_repo_visibility: str = "private"   # "private" | "public"
     init_timeout: int = 1800                   # 전체 타임아웃 30분
     init_exec_timeout: int = 600               # Sonnet 실행 단계 10분
+    init_ci_watch_timeout: int = 300           # CI 대기 최대 5분
+    init_ci_fix_retries: int = 2               # CI 실패 시 자동 수정 최대 횟수
     init_issue_planning_timeout: int = 900     # Opus 이슈 기획 15분
 
 

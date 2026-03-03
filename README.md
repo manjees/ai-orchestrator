@@ -11,10 +11,11 @@ Telegram  ──>  Bot (python-telegram-bot)
                 ├── tmux Viewer
                 ├── Service Controller (launchd)
                 └── AI Pipeline
-                    ├── /init   ──>  Project Bootstrap Pipeline (4-step)
+                    ├── /init   ──>  Project Bootstrap Pipeline (5-step)
                     │                ├── Stack Scout (Haiku CLI)
                     │                ├── Architecting (Opus CLI)
                     │                ├── Execution (Sonnet CLI)
+                    │                ├── CI Watch + Auto-Fix (Sonnet CLI)
                     │                └── Issue Planning (Opus CLI)
                     ├── /solve  ──>  Five-brid Pipeline (9-step, 5 models)
                     │                ├── Haiku Research (Claude CLI)
@@ -64,7 +65,7 @@ Telegram  ──>  Bot (python-telegram-bot)
 
 ### Init Pipeline (`/init`)
 
-A 4-step pipeline that bootstraps a new project end-to-end using only Claude CLI models (no Ollama required):
+A 5-step pipeline that bootstraps a new project end-to-end using only Claude CLI models (no Ollama required):
 
 ```
 /init [--public|--private] my-app A KMP mobile app for task management
@@ -72,7 +73,8 @@ A 4-step pipeline that bootstraps a new project end-to-end using only Claude CLI
 Step 0: [Haiku]   Stack Scout — tech stack + latest versions
 Step 1: [Opus]    Architecting — CLAUDE.md + agents.md generation
 Step 2: [Sonnet]  Execution — directory/file creation, git init, gh repo create
-Step 3: [Opus]    Issue Planning — 5-10 GitHub issues auto-created
+Step 3: [Sonnet]  CI Watch — wait for CI, auto-fix failures (up to N retries)
+Step 4: [Opus]    Issue Planning — 5-10 GitHub issues auto-created
 ```
 
 | Step | Model | Role | Fatal? |
@@ -80,12 +82,14 @@ Step 3: [Opus]    Issue Planning — 5-10 GitHub issues auto-created
 | 0 | **Haiku** (Claude CLI) | Tech stack research + version discovery | Fatal |
 | 1 | **Opus** (Claude CLI) | Generate CLAUDE.md + agents.md | Fatal |
 | 2 | **Sonnet** (Claude CLI) | Scaffold project, git init, push to GitHub | Fatal |
-| 3 | **Opus** (Claude CLI) | Plan and create 5-10 GitHub issues | Fatal |
+| 3 | **Sonnet** (Claude CLI) | Wait for CI, auto-fix on failure (max 2 retries) | Non-fatal on timeout |
+| 4 | **Opus** (Claude CLI) | Plan and create 5-10 GitHub issues | Fatal |
 
 Key features:
 - **Reference CLAUDE.md** — Reuses existing project's coding standards as a template
 - **Minimal Buildable Skeleton** — Creates stack-appropriate project structure (not just config files)
 - **Auto CI** — `.github/workflows/ci.yml` included based on detected build commands
+- **CI Auto-Fix** — If CI fails, Sonnet reads the failure log and pushes a fix automatically
 - **ai-managed label** — All generated issues tagged for easy filtering
 - **Instant `/solve`** — Project is registered in `projects.json` and ready for issue solving immediately
 

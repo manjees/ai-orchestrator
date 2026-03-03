@@ -1747,13 +1747,135 @@ async def step_init_execution(
         step.elapsed_sec = time.monotonic() - start
 
 
-async def step_init_issue_planning(
+async def _poll_ci_status(repo: str, timeout: int) -> tuple[str, str]:
+    """Poll GitHub Actions until the latest run completes or timeout. Returns (status, log)."""
+    deadline = time.monotonic() + timeout
+
+    # Wait a bit for the run to appear
+    await asyncio.sleep(10)
+
+    while time.monotonic() < deadline:
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "run", "list", "-R", repo, "--limit", "1",
+            "--json", "status,conclusion,databaseId",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if not stdout:
+            await asyncio.sleep(15)
+            continue
+
+        runs = json.loads(stdout.decode())
+        if not runs:
+            await asyncio.sleep(15)
+            continue
+
+        run = runs[0]
+        status = run.get("status", "")
+        conclusion = run.get("conclusion", "")
+        run_id = run.get("databaseId", "")
+
+        if status == "completed":
+            if conclusion == "success":
+                return "success", ""
+            # Fetch failed log
+            log_proc = await asyncio.create_subprocess_exec(
+                "gh", "run", "view", str(run_id), "-R", repo, "--log-failed",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            log_out, _ = await asyncio.wait_for(log_proc.communicate(), timeout=30)
+            log_text = log_out.decode(errors="replace") if log_out else "(no log)"
+            # Truncate to last 3000 chars
+            if len(log_text) > 3000:
+                log_text = log_text[-3000:]
+            return "failed", log_text
+
+        await asyncio.sleep(15)
+
+    return "timeout", "CI did not complete within timeout"
+
+
+async def step_init_ci_watch(
     ctx: InitContext,
     settings: Settings,
     progress_cb: ProgressCallback,
     step_index: int = 3,
 ) -> None:
-    """Step 3: Opus CLI generates GitHub issues as JSON, then creates them via gh."""
+    """Step 2.5: Wait for CI, auto-fix with Sonnet if it fails."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    repo = f"{ctx.github_user}/{ctx.project_name}"
+    max_retries = settings.init_ci_fix_retries
+
+    try:
+        for attempt in range(max_retries + 1):
+            attempt_label = f" (attempt {attempt + 1})" if attempt > 0 else ""
+            await progress_cb(f"CI Watch{attempt_label} — waiting for GitHub Actions...")
+
+            ci_status, ci_log = await _poll_ci_status(repo, settings.init_ci_watch_timeout)
+
+            if ci_status == "success":
+                step.status = "passed"
+                step.detail = f"CI passed{attempt_label}"
+                return
+
+            if ci_status == "timeout":
+                step.status = "skipped"
+                step.detail = "CI did not complete in time — skipping"
+                return
+
+            # CI failed
+            if attempt >= max_retries:
+                step.status = "failed"
+                step.detail = f"CI failed after {attempt + 1} fix attempts"
+                raise RuntimeError(step.detail)
+
+            # Auto-fix with Sonnet
+            await progress_cb(f"CI Watch — fixing CI failure (attempt {attempt + 1}/{max_retries})...")
+
+            fix_prompt = (
+                f"The GitHub Actions CI for this project has FAILED.\n\n"
+                f"--- CI Failure Log ---\n{ci_log}\n---\n\n"
+                f"Fix the issue so CI passes. Common causes:\n"
+                f"- Missing gradle wrapper (run: gradle wrapper)\n"
+                f"- Missing dependencies or config files\n"
+                f"- Incorrect build commands in .github/workflows/ci.yml\n"
+                f"- Missing source files referenced in build config\n\n"
+                f"After fixing, commit and push:\n"
+                f"git add -A && git commit -m \"fix: CI failure\" && git push"
+            )
+
+            await _call_claude_cli_with_progress(
+                fix_prompt,
+                model=settings.sonnet_model,
+                timeout=settings.init_exec_timeout,
+                progress_cb=progress_cb,
+                step_name=f"CI Fix (attempt {attempt + 1})",
+                cwd=ctx.project_path,
+                dangerously_skip_permissions=True,
+            )
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = str(exc)[:200]
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def step_init_issue_planning(
+    ctx: InitContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 4,
+) -> None:
+    """Step 4: Opus CLI generates GitHub issues as JSON, then creates them via gh."""
     step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
@@ -1864,11 +1986,12 @@ async def run_init_pipeline(
     progress_cb: ProgressCallback,
     reference_claude_md: str = "",
 ) -> tuple[str, str]:
-    """Run the 4-step init pipeline. Returns (status, detail)."""
+    """Run the 5-step init pipeline. Returns (status, detail)."""
     ctx.steps = [
         PipelineStep(name="Stack Scout (Haiku)"),
         PipelineStep(name="Architecting (Opus)"),
         PipelineStep(name="Execution (Sonnet)"),
+        PipelineStep(name="CI Watch (Sonnet)"),
         PipelineStep(name="Issue Planning (Opus)"),
     ]
 
@@ -1876,7 +1999,8 @@ async def run_init_pipeline(
         lambda: step_init_stack_scout(ctx, settings, progress_cb, step_index=0),
         lambda: step_init_architecting(ctx, settings, progress_cb, reference_claude_md, step_index=1),
         lambda: step_init_execution(ctx, settings, progress_cb, step_index=2),
-        lambda: step_init_issue_planning(ctx, settings, progress_cb, step_index=3),
+        lambda: step_init_ci_watch(ctx, settings, progress_cb, step_index=3),
+        lambda: step_init_issue_planning(ctx, settings, progress_cb, step_index=4),
     ]
 
     for i, func in enumerate(step_funcs):
