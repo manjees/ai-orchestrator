@@ -76,7 +76,7 @@ class Settings(BaseSettings):
 
     # Init Pipeline
     projects_base_dir: str = "~/Desktop/dev"
-    github_user: str = "manjees"
+    github_user: str = ""
     default_repo_visibility: str = "private"   # "private" | "public"
     init_timeout: int = 1800                   # 전체 타임아웃 30분
     init_exec_timeout: int = 600               # Sonnet 실행 단계 10분

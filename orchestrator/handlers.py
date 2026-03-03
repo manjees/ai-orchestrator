@@ -340,7 +340,7 @@ async def process_callback_handler(
 
 # ── /service ─────────────────────────────────────────────────────────────────
 
-_LAUNCHD_LABEL = "com.manjee.ai-orchestrator"
+_LAUNCHD_LABEL = os.environ.get("LAUNCHD_LABEL", "com.ai-orchestrator")
 _PLIST_PATH = os.path.expanduser(
     f"~/Library/LaunchAgents/{_LAUNCHD_LABEL}.plist"
 )
@@ -1701,6 +1701,11 @@ async def init_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         settings: Settings = context.bot_data["settings"]
+
+        if not settings.github_user:
+            await _safe_reply(update, "GITHUB_USER is not set in .env")
+            return
+
         projects: dict = context.bot_data.get("projects", {})
 
         # Duplicate check
