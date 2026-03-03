@@ -1908,13 +1908,31 @@ async def step_init_issue_planning(
             step_name="Issue Planning",
         )
 
-        # Strip markdown fences
+        # Extract JSON array from output (robust: find first [ ... last ])
         cleaned = re.sub(r"```(?:json)?\s*\n?", "", output)
         cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
 
-        issues = json.loads(cleaned)
-        if not isinstance(issues, list):
-            raise RuntimeError("Opus output is not a JSON array")
+        # Try direct parse first, then bracket extraction
+        issues = None
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list):
+                issues = parsed
+        except json.JSONDecodeError:
+            pass
+
+        if issues is None:
+            # Find JSON array by bracket matching
+            start_idx = cleaned.find("[")
+            end_idx = cleaned.rfind("]")
+            if start_idx != -1 and end_idx > start_idx:
+                try:
+                    issues = json.loads(cleaned[start_idx:end_idx + 1])
+                except json.JSONDecodeError:
+                    pass
+
+        if not issues or not isinstance(issues, list):
+            raise RuntimeError(f"Could not extract JSON array from Opus output ({len(output)} chars)")
 
         # Create ai-managed label (ignore if exists)
         label_proc = await asyncio.create_subprocess_exec(
@@ -1967,14 +1985,10 @@ async def step_init_issue_planning(
 
         step.status = "passed"
         step.detail = f"{created}/{total} issues created"
-    except json.JSONDecodeError as exc:
-        step.status = "failed"
-        step.detail = f"JSON parse error: {str(exc)[:150]}"
-        raise
     except Exception as exc:
-        step.status = "failed"
-        step.detail = str(exc)[:200]
-        raise
+        step.status = "skipped"
+        step.detail = f"Non-fatal: {str(exc)[:180]}"
+        logger.warning("Issue planning failed (non-fatal): %s", exc)
     finally:
         step.elapsed_sec = time.monotonic() - start
 
