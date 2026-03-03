@@ -20,6 +20,8 @@ from .handlers import (
     cmd_handler,
     extract_handler,
     help_handler,
+    init_cancel_callback,
+    init_handler,
     issues_handler,
     process_callback_handler,
     projects_handler,
@@ -77,6 +79,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("service", "Service control"),
         BotCommand("projects", "List registered projects"),
         BotCommand("issues", "Open GitHub issues for a project"),
+        BotCommand("init", "Bootstrap a new project"),
         BotCommand("solve", "Auto-solve issues via Claude"),
         BotCommand("rebase", "Rebase PR onto main"),
         BotCommand("extract", "Generate training data from file"),
@@ -130,6 +133,7 @@ def create_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("projects", projects_handler, filters=auth))
     app.add_handler(CommandHandler("issues", issues_handler, filters=auth))
     app.add_handler(CommandHandler("solve", solve_handler, filters=auth))
+    app.add_handler(CommandHandler("init", init_handler, filters=auth))
     app.add_handler(CommandHandler("rebase", rebase_handler, filters=auth))
     app.add_handler(CommandHandler("extract", extract_handler, filters=auth))
     app.add_handler(CommandHandler("help", help_handler, filters=auth))
@@ -138,6 +142,7 @@ def create_application(settings: Settings) -> Application:
     app.add_handler(CallbackQueryHandler(process_callback_handler, pattern=r"^proc:"))
     app.add_handler(CallbackQueryHandler(solve_inline_callback, pattern=r"^solve:"))
     app.add_handler(CallbackQueryHandler(solve_cancel_callback, pattern=r"^cancel_solve:"))
+    app.add_handler(CallbackQueryHandler(init_cancel_callback, pattern=r"^cancel_init:"))
 
     # Global error handler — never let exceptions kill the bot
     app.add_error_handler(_error_handler)

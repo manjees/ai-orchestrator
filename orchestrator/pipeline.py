@@ -1539,3 +1539,356 @@ def format_pipeline_summary(ctx: PipelineContext) -> str:
         lines.append(f"\n\U0001f4cb Review Feedback:\n{summary[:3000]}")
 
     return "\n".join(lines)
+
+
+# ── Init Pipeline ────────────────────────────────────────────────────────────
+
+@dataclass
+class InitContext:
+    project_name: str
+    description: str
+    project_path: str
+    github_user: str
+    repo_visibility: str
+    stack_research: str = ""
+    claude_md: str = ""
+    agents_md: str = ""
+    repo_url: str = ""
+    issues_created: list[dict] = field(default_factory=list)
+    steps: list[PipelineStep] = field(default_factory=list)
+
+
+def _extract_tag(text: str, tag: str) -> str:
+    """Extract content between <TAG>...</TAG> markers."""
+    pattern = rf"<{tag}>(.*?)</{tag}>"
+    m = re.search(pattern, text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+async def step_init_stack_scout(
+    ctx: InitContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 0,
+) -> None:
+    """Step 0: Haiku CLI investigates tech stack and latest versions."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    prompt = (
+        f"You are a tech stack research assistant.\n\n"
+        f"Project: {ctx.project_name}\n"
+        f"Description: {ctx.description}\n\n"
+        f"Tasks:\n"
+        f"1. Identify the optimal tech stack based on the project description.\n"
+        f"2. For each technology, find the latest stable version.\n"
+        f"3. List the recommended build tools, package managers, and test frameworks.\n"
+        f"4. Identify the standard project structure and key configuration files.\n"
+        f"5. List the build/test commands for CI.\n"
+        f"6. Note any important setup steps or dependencies.\n\n"
+        f"Be concise and factual. Output should be directly usable by an architect."
+    )
+
+    try:
+        output = await _call_claude_cli_with_progress(
+            prompt,
+            model=settings.haiku_model,
+            timeout=settings.research_timeout,
+            progress_cb=progress_cb,
+            step_name="Stack Scout",
+        )
+        ctx.stack_research = output
+        step.status = "passed"
+        step.detail = f"{len(output)} chars"
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = str(exc)[:200]
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def step_init_architecting(
+    ctx: InitContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    reference_claude_md: str = "",
+    step_index: int = 1,
+) -> None:
+    """Step 1: Opus CLI generates CLAUDE.md and agents.md."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    ref_section = ""
+    if reference_claude_md:
+        ref_section = (
+            f"\n\n--- Reference CLAUDE.md (use as style/quality template) ---\n"
+            f"{reference_claude_md}\n---\n"
+            f"Adapt the structure and coding standards from this reference "
+            f"to the new project's tech stack. Keep the senior-level quality bar.\n"
+        )
+
+    prompt = (
+        f"You are a senior architect bootstrapping a new project.\n\n"
+        f"Project: {ctx.project_name}\n"
+        f"Description: {ctx.description}\n\n"
+        f"--- Stack Research ---\n{ctx.stack_research}\n---\n"
+        f"{ref_section}\n"
+        f"Generate TWO files:\n\n"
+        f"1. CLAUDE.md — Project-specific coding standards, architecture decisions, "
+        f"file structure overview, naming conventions, testing requirements, "
+        f"and build/run/test commands. This file guides all future AI development.\n\n"
+        f"2. agents.md — Agent configuration defining roles (architect, implementer, "
+        f"reviewer) with their responsibilities and handoff protocols.\n\n"
+        f"Output format (STRICT — use these exact tags):\n"
+        f"<CLAUDE_MD>\n(full CLAUDE.md content)\n</CLAUDE_MD>\n"
+        f"===SPLIT===\n"
+        f"<AGENTS_MD>\n(full agents.md content)\n</AGENTS_MD>\n\n"
+        f"Be thorough and specific to this project's tech stack."
+    )
+
+    try:
+        output = await _call_claude_cli_with_progress(
+            prompt,
+            model=settings.opus_model,
+            timeout=settings.opus_design_timeout,
+            progress_cb=progress_cb,
+            step_name="Architecting",
+        )
+        ctx.claude_md = _extract_tag(output, "CLAUDE_MD")
+        ctx.agents_md = _extract_tag(output, "AGENTS_MD")
+
+        if not ctx.claude_md:
+            raise RuntimeError("Failed to extract CLAUDE_MD from Opus output")
+
+        step.status = "passed"
+        step.detail = f"CLAUDE.md: {len(ctx.claude_md)} chars, agents.md: {len(ctx.agents_md)} chars"
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = str(exc)[:200]
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def step_init_execution(
+    ctx: InitContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 2,
+) -> None:
+    """Step 2: Sonnet CLI creates directories, files, git init, gh repo create."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    prompt = (
+        f"You are a project scaffolding engineer. Create a new project from scratch.\n\n"
+        f"Project name: {ctx.project_name}\n"
+        f"Target directory: {ctx.project_path}\n"
+        f"Description: {ctx.description}\n\n"
+        f"--- Stack Research ---\n{ctx.stack_research}\n---\n\n"
+        f"--- CLAUDE.md (write to .claude/CLAUDE.md) ---\n{ctx.claude_md}\n---\n\n"
+        f"--- agents.md (write to .claude/agents.md) ---\n{ctx.agents_md}\n---\n\n"
+        f"TASKS (execute ALL in order):\n"
+        f"1. Create the project directory: mkdir -p {ctx.project_path}\n"
+        f"2. Create .claude/ directory and write CLAUDE.md and agents.md inside it\n"
+        f"3. Generate a comprehensive .gitignore based on the tech stack: include standard "
+        f"patterns for languages, IDEs, OS from Stack Research. Cover: build outputs, "
+        f"IDE configs (.idea/, .vscode/), OS artifacts (.DS_Store), dependency caches, secrets (.env)\n"
+        f"4. Create a README.md with project name, description, setup instructions, and tech stack\n"
+        f"5. Generate a MINIMAL but BUILDABLE project skeleton based on the Stack Research. "
+        f"Include all necessary config files (build configs, dependency files, etc.) "
+        f"and a minimal source structure so the project can build immediately.\n"
+        f"6. Create .github/workflows/ci.yml with push/PR triggers for build+test "
+        f"based on the build commands from Stack Research\n"
+        f"7. Run: git init && git branch -M main\n"
+        f"8. Run: git add -A && git commit -m \"Initial project scaffold\"\n"
+        f"9. Run: gh repo create {ctx.github_user}/{ctx.project_name} "
+        f"--{ctx.repo_visibility} --source=. --remote=origin --push\n\n"
+        f"SAFETY: If the directory {ctx.project_path} already exists or "
+        f"gh repo create fails because the repo already exists, "
+        f"STOP immediately and report the error. Do NOT overwrite.\n\n"
+        f"After completion, output the GitHub repo URL."
+    )
+
+    try:
+        output = await _call_claude_cli_with_progress(
+            prompt,
+            model=settings.sonnet_model,
+            timeout=settings.init_exec_timeout,
+            progress_cb=progress_cb,
+            step_name="Execution",
+            cwd=os.path.expanduser("~"),
+            dangerously_skip_permissions=True,
+        )
+
+        # Verify directory was created
+        if not os.path.isdir(ctx.project_path):
+            raise RuntimeError(f"Project directory not created: {ctx.project_path}")
+
+        # Extract GitHub URL
+        url_match = re.search(r"https://github\.com/[^\s\"'<>]+", output)
+        if url_match:
+            ctx.repo_url = url_match.group(0).rstrip(".,;)")
+
+        step.status = "passed"
+        step.detail = ctx.repo_url or "dir created (no URL extracted)"
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = str(exc)[:200]
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def step_init_issue_planning(
+    ctx: InitContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 3,
+) -> None:
+    """Step 3: Opus CLI generates GitHub issues as JSON, then creates them via gh."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    prompt = (
+        f"You are a project manager planning the initial development roadmap.\n\n"
+        f"Project: {ctx.project_name}\n"
+        f"Description: {ctx.description}\n\n"
+        f"--- Stack Research ---\n{ctx.stack_research}\n---\n\n"
+        f"--- CLAUDE.md ---\n{ctx.claude_md}\n---\n\n"
+        f"Create 5-10 GitHub issues that break down the initial implementation into "
+        f"manageable, well-scoped tasks. Each issue should be solvable by an AI agent "
+        f"in a single session.\n\n"
+        f"Output a JSON array (no markdown fences, no explanation, ONLY the JSON):\n"
+        f'[{{"title": "...", "body": "...", "labels": ["..."]}}]\n\n'
+        f"Rules:\n"
+        f"- Each issue body should include clear acceptance criteria\n"
+        f"- Order issues by dependency (foundational first)\n"
+        f"- Labels should be relevant (e.g., 'setup', 'feature', 'testing', 'ci')\n"
+        f"- Issues should cover: core features, testing, CI/CD, documentation\n"
+        f"- Be specific about file paths and implementation details"
+    )
+
+    try:
+        output = await _call_claude_cli_with_progress(
+            prompt,
+            model=settings.opus_model,
+            timeout=settings.init_issue_planning_timeout,
+            progress_cb=progress_cb,
+            step_name="Issue Planning",
+        )
+
+        # Strip markdown fences
+        cleaned = re.sub(r"```(?:json)?\s*\n?", "", output)
+        cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+
+        issues = json.loads(cleaned)
+        if not isinstance(issues, list):
+            raise RuntimeError("Opus output is not a JSON array")
+
+        # Create ai-managed label (ignore if exists)
+        label_proc = await asyncio.create_subprocess_exec(
+            "gh", "label", "create", "ai-managed",
+            "--color", "7057ff",
+            "--description", "Auto-generated by AI orchestrator",
+            "-R", f"{ctx.github_user}/{ctx.project_name}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(label_proc.communicate(), timeout=15)
+
+        created = 0
+        total = len(issues)
+        for issue in issues:
+            title = issue.get("title", "")
+            body = issue.get("body", "")
+            labels = issue.get("labels", [])
+            if not title:
+                continue
+
+            # Always add ai-managed label
+            if "ai-managed" not in labels:
+                labels.append("ai-managed")
+
+            cmd = [
+                "gh", "issue", "create",
+                "-R", f"{ctx.github_user}/{ctx.project_name}",
+                "--title", title,
+                "--body", body,
+            ]
+            for label in labels:
+                cmd.extend(["--label", label])
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                if proc.returncode == 0:
+                    url = stdout.decode().strip() if stdout else ""
+                    ctx.issues_created.append({"title": title, "url": url, "labels": labels})
+                    created += 1
+                else:
+                    logger.warning("Failed to create issue '%s': %s", title, stderr.decode()[:200])
+            except Exception as exc:
+                logger.warning("Failed to create issue '%s': %s", title, exc)
+
+        step.status = "passed"
+        step.detail = f"{created}/{total} issues created"
+    except json.JSONDecodeError as exc:
+        step.status = "failed"
+        step.detail = f"JSON parse error: {str(exc)[:150]}"
+        raise
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = str(exc)[:200]
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def run_init_pipeline(
+    ctx: InitContext,
+    settings: Settings,
+    cancel_event: asyncio.Event,
+    progress_cb: ProgressCallback,
+    reference_claude_md: str = "",
+) -> tuple[str, str]:
+    """Run the 4-step init pipeline. Returns (status, detail)."""
+    ctx.steps = [
+        PipelineStep(name="Stack Scout (Haiku)"),
+        PipelineStep(name="Architecting (Opus)"),
+        PipelineStep(name="Execution (Sonnet)"),
+        PipelineStep(name="Issue Planning (Opus)"),
+    ]
+
+    step_funcs = [
+        lambda: step_init_stack_scout(ctx, settings, progress_cb, step_index=0),
+        lambda: step_init_architecting(ctx, settings, progress_cb, reference_claude_md, step_index=1),
+        lambda: step_init_execution(ctx, settings, progress_cb, step_index=2),
+        lambda: step_init_issue_planning(ctx, settings, progress_cb, step_index=3),
+    ]
+
+    for i, func in enumerate(step_funcs):
+        if cancel_event.is_set():
+            for j in range(i, len(ctx.steps)):
+                ctx.steps[j].status = "skipped"
+                ctx.steps[j].detail = "Cancelled"
+            return "skipped", "Cancelled by user"
+
+        try:
+            await func()
+        except Exception as exc:
+            # All steps are fatal
+            for j in range(i + 1, len(ctx.steps)):
+                ctx.steps[j].status = "skipped"
+            return "failed", f"Step {i} ({ctx.steps[i].name}) failed: {str(exc)[:200]}"
+
+    return "success", f"Project created: {ctx.repo_url}"

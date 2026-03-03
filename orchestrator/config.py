@@ -74,6 +74,32 @@ class Settings(BaseSettings):
     # Phase C: Cross-Review (Gemini CLI)
     gemini_cross_review_timeout: int = 600  # 10 min
 
+    # Init Pipeline
+    projects_base_dir: str = "~/Desktop/dev"
+    github_user: str = "manjees"
+    default_repo_visibility: str = "private"   # "private" | "public"
+    init_timeout: int = 1800                   # 전체 타임아웃 30분
+    init_exec_timeout: int = 600               # Sonnet 실행 단계 10분
+    init_issue_planning_timeout: int = 900     # Opus 이슈 기획 15분
+
+
+def save_projects(projects: dict[str, dict]) -> None:
+    """Write projects dict to projects.json, contracting home dir to ~ for portability."""
+    home = str(Path.home())
+    out: dict[str, dict] = {}
+    for name, info in projects.items():
+        entry = dict(info)
+        if "path" in entry:
+            p = str(entry["path"])
+            if p.startswith(home):
+                p = "~" + p[len(home):]
+            entry["path"] = p
+        out[name] = entry
+    with open(_PROJECTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    logger.info("Saved %d project(s) to %s", len(out), _PROJECTS_FILE)
+
 
 def load_projects() -> dict[str, dict]:
     """Read projects.json and return {name: {path: ...}} with expanded paths."""

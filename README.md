@@ -1,6 +1,6 @@
 # AI Orchestrator
 
-Telegram bot that turns a Mac Mini into a remote AI-powered development server. Control system monitoring, run shell commands, and **auto-solve GitHub issues** — all from your phone.
+Telegram bot that turns a Mac Mini into a remote AI-powered development server. **Bootstrap new projects**, auto-solve GitHub issues, and control system monitoring — all from your phone.
 
 ## Architecture
 
@@ -11,6 +11,11 @@ Telegram  ──>  Bot (python-telegram-bot)
                 ├── tmux Viewer
                 ├── Service Controller (launchd)
                 └── AI Pipeline
+                    ├── /init   ──>  Project Bootstrap Pipeline (4-step)
+                    │                ├── Stack Scout (Haiku CLI)
+                    │                ├── Architecting (Opus CLI)
+                    │                ├── Execution (Sonnet CLI)
+                    │                └── Issue Planning (Opus CLI)
                     ├── /solve  ──>  Five-brid Pipeline (9-step, 5 models)
                     │                ├── Haiku Research (Claude CLI)
                     │                ├── Opus Design (Claude CLI)
@@ -35,10 +40,54 @@ Telegram  ──>  Bot (python-telegram-bot)
 - `/service` — launchd service control (start/stop/restart/logs)
 
 ### AI-Powered Development
+- `/init <name> <description>` — Bootstrap a new project (stack research → scaffold → GitHub → issues)
 - `/issues <project>` — List open GitHub issues with inline Solve buttons
 - `/solve <project> <#> [#...]` — Auto-solve issues via configurable pipeline
 - `/rebase <project> <pr#>` — Rebase PR onto main, auto-resolve conflicts with Claude
 - `/extract <project> <file>` — Generate JSONL training data from a source file
+
+### Typical Workflow
+
+```
+/init my-app A KMP mobile app for task management
+  → Stack Scout → CLAUDE.md → Scaffold + GitHub repo → 7 issues created
+  → projects.json auto-registered
+
+/issues my-app
+  → #1 Setup Gradle build system  [Solve]
+  → #2 Implement shared module     [Solve]
+  → ...
+
+/solve my-app 1 2 3
+  → Parallel solve via Five-brid pipeline → PRs created
+```
+
+### Init Pipeline (`/init`)
+
+A 4-step pipeline that bootstraps a new project end-to-end using only Claude CLI models (no Ollama required):
+
+```
+/init my-app A KMP mobile app for task management
+
+Step 0: [Haiku]   Stack Scout — tech stack + latest versions
+Step 1: [Opus]    Architecting — CLAUDE.md + agents.md generation
+Step 2: [Sonnet]  Execution — directory/file creation, git init, gh repo create
+Step 3: [Opus]    Issue Planning — 5-10 GitHub issues auto-created
+```
+
+| Step | Model | Role | Fatal? |
+|------|-------|------|--------|
+| 0 | **Haiku** (Claude CLI) | Tech stack research + version discovery | Fatal |
+| 1 | **Opus** (Claude CLI) | Generate CLAUDE.md + agents.md | Fatal |
+| 2 | **Sonnet** (Claude CLI) | Scaffold project, git init, push to GitHub | Fatal |
+| 3 | **Opus** (Claude CLI) | Plan and create 5-10 GitHub issues | Fatal |
+
+Key features:
+- **Reference CLAUDE.md** — Reuses existing project's coding standards as a template
+- **Minimal Buildable Skeleton** — Creates stack-appropriate project structure (not just config files)
+- **Auto CI** — `.github/workflows/ci.yml` included based on detected build commands
+- **ai-managed label** — All generated issues tagged for easy filtering
+- **Instant `/solve`** — Project is registered in `projects.json` and ready for issue solving immediately
 
 ### Five-brid Pipeline (`PIPELINE_MODE=fivebrid`)
 
@@ -108,10 +157,10 @@ Automatically rebases a PR branch onto `main`. When conflicts occur, Claude CLI 
 ### Prerequisites
 - macOS with [Homebrew](https://brew.sh)
 - Python 3.11+, [uv](https://github.com/astral-sh/uv)
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed (required for `/init` and `/solve`)
+- [GitHub CLI](https://cli.github.com/) (`gh`) authenticated (required for `/init` and `/solve`)
 - [Gemini CLI](https://github.com/google-gemini/gemini-cli) installed (for fivebrid mode)
-- [GitHub CLI](https://cli.github.com/) (`gh`) authenticated
-- [Ollama](https://ollama.ai) with DeepSeek R1 and Qwen2.5-Coder-32B models
+- [Ollama](https://ollama.ai) with DeepSeek R1 and Qwen2.5-Coder-32B models (for fivebrid/legacy mode)
 
 ### Install
 
@@ -129,6 +178,8 @@ cp .env.example .env
 #   TELEGRAM_BOT_TOKEN=...
 #   TELEGRAM_ALLOWED_USER_ID=...
 #   PIPELINE_MODE=fivebrid  (or legacy)
+#   GITHUB_USER=your-github-username  (for /init)
+#   PROJECTS_BASE_DIR=~/Desktop/dev   (for /init)
 
 cp orchestrator/projects.json.example orchestrator/projects.json
 # Edit projects.json with your project paths
@@ -150,8 +201,8 @@ orchestrator/
 ├── __main__.py          # Entrypoint
 ├── bot.py               # Telegram app factory & provider init
 ├── config.py            # Pydantic settings (.env)
-├── handlers.py          # Command handlers (/status, /cmd, /solve, /rebase, ...)
-├── pipeline.py          # Five-brid + legacy pipelines
+├── handlers.py          # Command handlers (/status, /cmd, /init, /solve, /rebase, ...)
+├── pipeline.py          # Init + Five-brid + legacy pipelines
 ├── security.py          # Auth filter & secret masking
 ├── system_monitor.py    # CPU, RAM, Disk, Thermal via psutil
 ├── tmux_manager.py      # tmux session capture

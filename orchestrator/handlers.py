@@ -18,7 +18,14 @@ from telegram.ext import ContextTypes
 from .ai.anthropic_provider import AnthropicProvider
 from .ai.gemini_provider import GeminiCLIProvider
 from .ai.ollama_provider import OllamaProvider
-from .pipeline import PipelineContext, format_pipeline_summary, run_dual_check_pipeline, run_fivebrid_pipeline
+from .pipeline import (
+    InitContext,
+    PipelineContext,
+    format_pipeline_summary,
+    run_dual_check_pipeline,
+    run_fivebrid_pipeline,
+    run_init_pipeline,
+)
 from .security import mask_secrets
 from .system_monitor import get_system_status
 from .tmux_manager import capture_pane, list_sessions
@@ -31,6 +38,9 @@ _MONITORED_PROCESSES = {"ollama", "python", "node"}
 # Active solve sessions: chat_id → {issue_num → asyncio.Event}
 _solve_cancels: dict[int, dict[int, asyncio.Event]] = {}
 _solve_active: dict[int, int] = {}  # chat_id → number of active solve sessions
+
+# Active init sessions: chat_id → asyncio.Event
+_init_cancels: dict[int, asyncio.Event] = {}
 
 # ANSI escape codes: CSI sequences (incl. ?/= private modes), OSC sequences, single ESC codes
 _ANSI_RE = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^[\]()]")
@@ -1651,6 +1661,253 @@ async def extract_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_reply(update, "Error generating training data.")
 
 
+# ── /init ────────────────────────────────────────────────────────────────────
+
+_PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+async def init_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bootstrap a new project: /init <project_name> <description...>"""
+    try:
+        if not context.args or len(context.args) < 2:
+            await _safe_reply(
+                update,
+                "Usage: <code>/init &lt;project_name&gt; &lt;description&gt;</code>\n"
+                "Example: <code>/init my-app A KMP mobile app for task management</code>",
+            )
+            return
+
+        project_name = context.args[0]
+        description = " ".join(context.args[1:])
+
+        # Validate project name
+        if not _PROJECT_NAME_RE.match(project_name):
+            await _safe_reply(
+                update,
+                f"Invalid project name: <code>{html.escape(project_name)}</code>\n"
+                f"Must match: <code>[a-z0-9][a-z0-9-]*</code>",
+            )
+            return
+
+        settings: Settings = context.bot_data["settings"]
+        projects: dict = context.bot_data.get("projects", {})
+
+        # Duplicate check
+        if project_name in projects:
+            await _safe_reply(update, f"Project <b>{html.escape(project_name)}</b> already exists in projects.json")
+            return
+
+        # Directory check
+        base_dir = os.path.expanduser(settings.projects_base_dir)
+        project_path = os.path.join(base_dir, project_name)
+        if os.path.exists(project_path):
+            await _safe_reply(update, f"Directory already exists: <code>{html.escape(project_path)}</code>")
+            return
+
+        chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+        # Prevent double-init
+        if chat_id in _init_cancels:
+            await _safe_reply(update, "An init is already running. Cancel it first.")
+            return
+
+        cancel_event = asyncio.Event()
+        _init_cancels[chat_id] = cancel_event
+
+        # Background task
+        asyncio.create_task(
+            _run_init(context, chat_id, project_name, description, project_path, settings, cancel_event)
+        )
+
+        await _safe_reply(
+            update,
+            f"Bootstrapping <b>{html.escape(project_name)}</b>...\n"
+            f"<i>{html.escape(description)}</i>",
+        )
+    except Exception:
+        logger.exception("/init handler error")
+        await _safe_reply(update, "Error starting init.")
+
+
+def _find_reference_claude_md(projects: dict[str, dict]) -> str:
+    """Find a reference CLAUDE.md using 3-tier priority."""
+    # Priority 1: Global template
+    global_template = os.path.expanduser("~/.ai_orchestrator/templates/CLAUDE.md.template")
+    if os.path.isfile(global_template):
+        try:
+            with open(global_template, encoding="utf-8") as f:
+                content = f.read()
+            if content.strip():
+                logger.info("Using global CLAUDE.md template: %s", global_template)
+                return content
+        except Exception:
+            pass
+
+    # Priority 2: Most recently modified CLAUDE.md from existing projects
+    candidates: list[tuple[float, str]] = []
+    for info in projects.values():
+        p = info.get("path", "")
+        if not p:
+            continue
+        claude_path = os.path.join(p, ".claude", "CLAUDE.md")
+        if os.path.isfile(claude_path):
+            try:
+                mtime = os.path.getmtime(claude_path)
+                candidates.append((mtime, claude_path))
+            except Exception:
+                pass
+
+    if candidates:
+        candidates.sort(reverse=True)  # newest first
+        best_path = candidates[0][1]
+        try:
+            with open(best_path, encoding="utf-8") as f:
+                content = f.read()
+            if content.strip():
+                logger.info("Using reference CLAUDE.md: %s", best_path)
+                return content
+        except Exception:
+            pass
+
+    # Priority 3: Empty (Opus generates from scratch)
+    logger.info("No reference CLAUDE.md found — Opus will generate from scratch")
+    return ""
+
+
+async def _run_init(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    project_name: str,
+    description: str,
+    project_path: str,
+    settings,
+    cancel_event: asyncio.Event,
+) -> None:
+    """Background task that runs the 4-step init pipeline."""
+    cancel_btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Cancel", callback_data=f"cancel_init:{chat_id}")]
+    ])
+    msg = await context.bot.send_message(
+        chat_id,
+        f"<b>{html.escape(project_name)}</b> [0/4] Starting init pipeline...",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_btn,
+    )
+
+    pipeline_start = time.monotonic()
+
+    try:
+        # Find reference CLAUDE.md
+        projects: dict = context.bot_data.get("projects", {})
+        reference_claude_md = _find_reference_claude_md(projects)
+
+        ctx = InitContext(
+            project_name=project_name,
+            description=description,
+            project_path=project_path,
+            github_user=settings.github_user,
+            repo_visibility=settings.default_repo_visibility,
+        )
+
+        async def progress_cb(status_text: str) -> None:
+            elapsed = int(time.monotonic() - pipeline_start)
+            mins, secs = divmod(elapsed, 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            text = (
+                f"<b>{html.escape(project_name)}</b> {html.escape(status_text)}\n"
+                f"[{time_str}]"
+            )
+            await _edit_msg(msg, text, reply_markup=cancel_btn)
+
+        status, detail = await run_init_pipeline(
+            ctx, settings, cancel_event, progress_cb, reference_claude_md,
+        )
+
+        elapsed = int(time.monotonic() - pipeline_start)
+        mins, secs = divmod(elapsed, 60)
+        total_time = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        # Format pipeline summary (works with InitContext since it has .steps)
+        summary_lines: list[str] = []
+        for s in ctx.steps:
+            icon = {
+                "passed": "\u2705", "failed": "\u274c", "skipped": "\u23ed",
+                "running": "\u23f3", "pending": "\u2b1c",
+            }.get(s.status, "\u2753")
+            elapsed_str = ""
+            if s.elapsed_sec > 0:
+                m, sc = divmod(int(s.elapsed_sec), 60)
+                elapsed_str = f" ({m}m {sc}s)" if m else f" ({sc}s)"
+            summary_lines.append(f"  {icon} {s.name}{elapsed_str}")
+        summary = "\n".join(summary_lines)
+
+        if status == "success":
+            # Register in projects.json
+            from .config import save_projects
+
+            projects[project_name] = {"path": project_path}
+            save_projects(projects)
+            context.bot_data["projects"] = projects
+
+            # Build issues list
+            issues_text = ""
+            if ctx.issues_created:
+                issue_lines = []
+                for iss in ctx.issues_created:
+                    url = iss.get("url", "")
+                    title = iss.get("title", "")
+                    if url:
+                        issue_lines.append(f"  - <a href=\"{url}\">{html.escape(title)}</a>")
+                    else:
+                        issue_lines.append(f"  - {html.escape(title)}")
+                issues_text = "\n<b>Issues Created:</b>\n" + "\n".join(issue_lines)
+
+            repo_text = f"\nRepo: {ctx.repo_url}" if ctx.repo_url else ""
+
+            await _edit_msg(
+                msg,
+                f"<b>{html.escape(project_name)}</b> \u2705 Bootstrapped in {total_time}\n"
+                f"{repo_text}\n\n"
+                f"<b>Pipeline Steps:</b>\n{html.escape(summary)}"
+                f"{issues_text}\n\n"
+                f"Ready for <code>/solve {html.escape(project_name)} 1</code>",
+            )
+        else:
+            await _edit_msg(
+                msg,
+                f"<b>{html.escape(project_name)}</b> \u274c {html.escape(status)}: "
+                f"{html.escape(detail[:200])}\n[{total_time}]\n\n"
+                f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
+            )
+    except Exception as exc:
+        logger.exception("Init pipeline error for %s", project_name)
+        await _edit_msg(msg, f"<b>{html.escape(project_name)}</b> \u274c Error: {html.escape(str(exc)[:200])}")
+    finally:
+        _init_cancels.pop(chat_id, None)
+
+
+async def init_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Cancel button press during init."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer("Cancelling...")
+
+    try:
+        data = query.data or ""
+        parts = data.split(":")
+        chat_id = int(parts[1])
+
+        event = _init_cancels.get(chat_id)
+        if event:
+            event.set()
+            await query.edit_message_text("Cancel requested. Stopping after current step...")
+        else:
+            await query.edit_message_text("No active init session to cancel.")
+    except Exception:
+        logger.exception("init cancel callback error")
+
+
 # ── /help ────────────────────────────────────────────────────────────────────
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1664,6 +1921,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/service — Service control (status/restart/stop/start/logs)\n"
         "\n"
         "/projects — List registered projects\n"
+        "/init &lt;name&gt; &lt;description&gt; — Bootstrap a new project\n"
         "/issues &lt;project&gt; — Open GitHub issues (with Solve buttons)\n"
         "/solve &lt;project&gt; &lt;#&gt; [#...] — Auto-solve issues via Claude\n"
         "/rebase &lt;project&gt; &lt;pr#&gt; — Rebase PR onto latest main\n"
