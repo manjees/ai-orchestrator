@@ -87,6 +87,11 @@ class Settings(BaseSettings):
     init_ci_fix_retries: int = 2               # CI 실패 시 자동 수정 최대 횟수
     init_issue_planning_timeout: int = 900     # Opus 이슈 기획 15분
 
+    # Plan & Discuss Commands
+    plan_timeout: int = 900               # Opus 이슈 기획 (15분)
+    discuss_timeout: int = 600            # Opus 기술 상담 (10분)
+    discuss_issue_timeout: int = 300      # 논의 → 이슈 변환 (5분)
+
 
 def save_projects(projects: dict[str, dict]) -> None:
     """Write projects dict to projects.json, contracting home dir to ~ for portability."""

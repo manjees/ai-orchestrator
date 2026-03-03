@@ -25,6 +25,9 @@ from .pipeline import (
     run_dual_check_pipeline,
     run_fivebrid_pipeline,
     run_init_pipeline,
+    step_plan_issues,
+    step_discuss_consult,
+    step_discuss_to_issues,
 )
 from .security import mask_secrets
 from .system_monitor import get_system_status
@@ -41,6 +44,15 @@ _solve_active: dict[int, int] = {}  # chat_id → number of active solve session
 
 # Active init sessions: chat_id → asyncio.Event
 _init_cancels: dict[int, asyncio.Event] = {}
+
+# Active plan sessions: chat_id → asyncio.Event
+_plan_cancels: dict[int, asyncio.Event] = {}
+
+# Active discuss sessions: chat_id → asyncio.Event
+_discuss_cancels: dict[int, asyncio.Event] = {}
+
+# Discuss results for [Create Issues] button: message_id → context dict
+_discuss_results: dict[int, dict] = {}
 
 # ANSI escape codes: CSI sequences (incl. ?/= private modes), OSC sequences, single ESC codes
 _ANSI_RE = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^[\]()]")
@@ -1938,6 +1950,517 @@ async def init_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("init cancel callback error")
 
 
+# ── /plan ─────────────────────────────────────────────────────────────────────
+
+
+async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/plan <project> — Plan next-stage issues for an existing project."""
+    try:
+        if not context.args:
+            await _safe_reply(update, "Usage: <code>/plan &lt;project&gt;</code>")
+            return
+
+        project_name = context.args[0]
+        settings: Settings = context.bot_data["settings"]
+
+        if not settings.github_user:
+            await _safe_reply(update, "GITHUB_USER is not set in .env")
+            return
+
+        projects: dict = context.bot_data.get("projects", {})
+        if project_name not in projects:
+            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+            return
+
+        chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+        if chat_id in _plan_cancels:
+            await _safe_reply(update, "A plan is already running. Cancel it first.")
+            return
+
+        cancel_event = asyncio.Event()
+        _plan_cancels[chat_id] = cancel_event
+
+        project_path = projects[project_name].get("path", "")
+
+        asyncio.create_task(
+            _run_plan(context, chat_id, project_name, project_path, settings, cancel_event)
+        )
+
+        await _safe_reply(
+            update,
+            f"Planning next-stage issues for <b>{html.escape(project_name)}</b>...",
+        )
+    except Exception:
+        logger.exception("/plan handler error")
+        await _safe_reply(update, "Error starting plan.")
+
+
+async def _run_plan(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    project_name: str,
+    project_path: str,
+    settings: Settings,
+    cancel_event: asyncio.Event,
+) -> None:
+    """Background task that plans next-stage issues."""
+    cancel_btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Cancel", callback_data=f"cancel_plan:{chat_id}")]
+    ])
+    msg = await context.bot.send_message(
+        chat_id,
+        f"<b>{html.escape(project_name)}</b> Fetching existing issues...",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_btn,
+    )
+
+    pipeline_start = time.monotonic()
+
+    try:
+        # 1. Fetch existing issues (open + closed)
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "issue", "list",
+            "-R", f"{settings.github_user}/{project_name}",
+            "--state", "all", "--limit", "50",
+            "--json", "number,title,labels,state",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        existing_issues_text = stdout.decode(errors="replace") if stdout else "[]"
+
+        # 2. Read CLAUDE.md
+        claude_md_path = os.path.join(project_path, ".claude", "CLAUDE.md")
+        claude_md = ""
+        if os.path.isfile(claude_md_path):
+            try:
+                with open(claude_md_path, encoding="utf-8") as f:
+                    claude_md = f.read()
+            except Exception:
+                pass
+
+        # 3. Cancel check
+        if cancel_event.is_set():
+            await _edit_msg(msg, f"<b>{html.escape(project_name)}</b> Plan cancelled.")
+            return
+
+        # 4. Call step_plan_issues
+        async def progress_cb(status_text: str) -> None:
+            elapsed = int(time.monotonic() - pipeline_start)
+            mins, secs = divmod(elapsed, 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            text = (
+                f"<b>{html.escape(project_name)}</b> {html.escape(status_text)}\n"
+                f"[{time_str}]"
+            )
+            await _edit_msg(msg, text, reply_markup=cancel_btn)
+
+        created, total, issues_list = await step_plan_issues(
+            project_name=project_name,
+            project_path=project_path,
+            github_user=settings.github_user,
+            existing_issues_text=existing_issues_text,
+            claude_md=claude_md,
+            settings=settings,
+            progress_cb=progress_cb,
+        )
+
+        # 5. Report results
+        elapsed = int(time.monotonic() - pipeline_start)
+        mins, secs = divmod(elapsed, 60)
+        total_time = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        issue_lines = []
+        for iss in issues_list:
+            url = iss.get("url", "")
+            title = iss.get("title", "")
+            if url:
+                issue_lines.append(f"  - <a href=\"{url}\">{html.escape(title)}</a>")
+            else:
+                issue_lines.append(f"  - {html.escape(title)}")
+        issues_text = "\n".join(issue_lines) if issue_lines else "  (none)"
+
+        await _edit_msg(
+            msg,
+            f"<b>{html.escape(project_name)}</b> \u2705 Plan complete in {total_time}\n"
+            f"Issues created: {created}/{total}\n\n"
+            f"{issues_text}",
+        )
+    except Exception as exc:
+        logger.exception("Plan pipeline error for %s", project_name)
+        await _edit_msg(msg, f"<b>{html.escape(project_name)}</b> \u274c Error: {html.escape(str(exc)[:200])}")
+    finally:
+        _plan_cancels.pop(chat_id, None)
+
+
+async def plan_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Cancel button press during plan."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer("Cancelling...")
+
+    try:
+        data = query.data or ""
+        parts = data.split(":")
+        chat_id = int(parts[1])
+
+        event = _plan_cancels.get(chat_id)
+        if event:
+            event.set()
+            await query.edit_message_text("Cancel requested. Stopping after current step...")
+        else:
+            await query.edit_message_text("No active plan session to cancel.")
+    except Exception:
+        logger.exception("plan cancel callback error")
+
+
+# ── /discuss ──────────────────────────────────────────────────────────────────
+
+
+def _split_message(text: str, max_len: int = 4000) -> list[str]:
+    """Split text into chunks respecting Telegram's 4096 char limit, at paragraph boundaries."""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+
+        # Try paragraph boundary
+        cut = remaining.rfind("\n\n", 0, max_len)
+        if cut == -1:
+            # Try line boundary
+            cut = remaining.rfind("\n", 0, max_len)
+        if cut == -1:
+            # Hard cut
+            cut = max_len
+
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+
+    return chunks
+
+
+async def discuss_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/discuss <project> <question> — Technical consultation with Opus."""
+    try:
+        if not context.args or len(context.args) < 2:
+            await _safe_reply(
+                update,
+                "Usage: <code>/discuss &lt;project&gt; &lt;question&gt;</code>\n"
+                "Example: <code>/discuss my-app What features should we add for monitoring?</code>",
+            )
+            return
+
+        project_name = context.args[0]
+        question = " ".join(context.args[1:])
+
+        projects: dict = context.bot_data.get("projects", {})
+        if project_name not in projects:
+            await _safe_reply(update, f"Unknown project: <code>{html.escape(project_name)}</code>")
+            return
+
+        chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+        if chat_id in _discuss_cancels:
+            await _safe_reply(update, "A discussion is already running. Cancel it first.")
+            return
+
+        settings: Settings = context.bot_data["settings"]
+        cancel_event = asyncio.Event()
+        _discuss_cancels[chat_id] = cancel_event
+
+        project_path = projects[project_name].get("path", "")
+
+        asyncio.create_task(
+            _run_discuss(context, chat_id, project_name, project_path, question, settings, cancel_event)
+        )
+
+        await _safe_reply(
+            update,
+            f"Consulting Opus about <b>{html.escape(project_name)}</b>...\n"
+            f"<i>{html.escape(question)}</i>",
+        )
+    except Exception:
+        logger.exception("/discuss handler error")
+        await _safe_reply(update, "Error starting discussion.")
+
+
+async def _run_discuss(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    project_name: str,
+    project_path: str,
+    question: str,
+    settings: Settings,
+    cancel_event: asyncio.Event,
+) -> None:
+    """Background task for Opus tech consultation."""
+    cancel_btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Cancel", callback_data=f"cancel_discuss:{chat_id}")]
+    ])
+    msg = await context.bot.send_message(
+        chat_id,
+        f"<b>{html.escape(project_name)}</b> Gathering project context...",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_btn,
+    )
+
+    pipeline_start = time.monotonic()
+
+    try:
+        # 1. Read CLAUDE.md
+        claude_md_path = os.path.join(project_path, ".claude", "CLAUDE.md")
+        claude_md = ""
+        if os.path.isfile(claude_md_path):
+            try:
+                with open(claude_md_path, encoding="utf-8") as f:
+                    claude_md = f.read()
+            except Exception:
+                pass
+
+        # 2. File tree (excluding common dirs)
+        try:
+            tree_proc = await asyncio.create_subprocess_exec(
+                "find", ".", "-type", "f",
+                "-not", "-path", "./.git/*",
+                "-not", "-path", "*/node_modules/*",
+                "-not", "-path", "*/build/*",
+                "-not", "-path", "*/__pycache__/*",
+                "-not", "-path", "*/.venv/*",
+                "-not", "-path", "*/.gradle/*",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=project_path,
+            )
+            tree_stdout, _ = await asyncio.wait_for(tree_proc.communicate(), timeout=15)
+            file_tree_lines = tree_stdout.decode(errors="replace").strip().split("\n") if tree_stdout else []
+            file_tree = "\n".join(file_tree_lines[:200])
+        except Exception:
+            file_tree = "(could not collect file tree)"
+
+        # 3. Build context — auto-detect project type and collect key build files
+        build_files: dict[str, str] = {}
+        candidates = [
+            "build.gradle.kts",
+            "settings.gradle.kts",
+            "gradle/libs.versions.toml",
+            "package.json",
+            "pyproject.toml",
+            "requirements.txt",
+        ]
+        for candidate in candidates:
+            full_path = os.path.join(project_path, candidate)
+            if os.path.isfile(full_path):
+                try:
+                    with open(full_path, encoding="utf-8") as f:
+                        lines = f.readlines()
+                    build_files[candidate] = "".join(lines[:200])
+                except Exception:
+                    pass
+
+        build_context = ""
+        if build_files:
+            parts = []
+            for fname, content in build_files.items():
+                parts.append(f"### {fname}\n{content}")
+            build_context = "\n\n".join(parts)
+
+        # 4. Cancel check
+        if cancel_event.is_set():
+            await _edit_msg(msg, f"<b>{html.escape(project_name)}</b> Discussion cancelled.")
+            return
+
+        # 5. Call step_discuss_consult
+        async def progress_cb(status_text: str) -> None:
+            elapsed = int(time.monotonic() - pipeline_start)
+            mins, secs = divmod(elapsed, 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            text = (
+                f"<b>{html.escape(project_name)}</b> {html.escape(status_text)}\n"
+                f"[{time_str}]"
+            )
+            await _edit_msg(msg, text, reply_markup=cancel_btn)
+
+        response = await step_discuss_consult(
+            project_name=project_name,
+            claude_md=claude_md,
+            file_tree=file_tree,
+            build_context=build_context,
+            question=question,
+            settings=settings,
+            progress_cb=progress_cb,
+        )
+
+        # 6. Send response in chunks
+        chunks = _split_message(response)
+        last_sent_msg = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            if is_last:
+                # Add [Create Issues] button on last chunk
+                issues_btn = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Create Issues", callback_data=f"discuss_issues:{msg.message_id}")]
+                ])
+                if i == 0:
+                    # Edit the progress message with the response
+                    await _edit_msg(msg, chunk, reply_markup=issues_btn)
+                    last_sent_msg = msg
+                else:
+                    last_sent_msg = await context.bot.send_message(
+                        chat_id, chunk, reply_markup=issues_btn,
+                    )
+            else:
+                if i == 0:
+                    await _edit_msg(msg, chunk)
+                else:
+                    await context.bot.send_message(chat_id, chunk)
+
+        # 7. Store discussion result for [Create Issues] button
+        # Memory management: keep max 10 entries
+        if len(_discuss_results) >= 10:
+            oldest_key = next(iter(_discuss_results))
+            _discuss_results.pop(oldest_key, None)
+
+        _discuss_results[msg.message_id] = {
+            "project_name": project_name,
+            "project_path": project_path,
+            "github_user": settings.github_user,
+            "question": question,
+            "response": response,
+        }
+
+        # 8. Save discussion to file
+        try:
+            discussions_dir = os.path.join(project_path, "discussions")
+            os.makedirs(discussions_dir, exist_ok=True)
+
+            # Generate slug from question
+            slug = re.sub(r"[^a-z0-9]+", "-", question.lower())[:60].strip("-")
+            from datetime import date
+            filename = f"{date.today().isoformat()}_{slug}.md"
+            filepath = os.path.join(discussions_dir, filename)
+
+            content = (
+                f"## Question\n{question}\n\n"
+                f"## Response\n{response}\n\n"
+                f"## Metadata\n"
+                f"- Date: {date.today().isoformat()}\n"
+                f"- Model: opus\n"
+            )
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+            logger.info("Saved discussion to %s", filepath)
+        except Exception as exc:
+            logger.warning("Failed to save discussion file: %s", exc)
+
+    except Exception as exc:
+        logger.exception("Discuss pipeline error for %s", project_name)
+        await _edit_msg(msg, f"<b>{html.escape(project_name)}</b> \u274c Error: {html.escape(str(exc)[:200])}")
+    finally:
+        _discuss_cancels.pop(chat_id, None)
+
+
+async def discuss_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Cancel button press during discuss."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer("Cancelling...")
+
+    try:
+        data = query.data or ""
+        parts = data.split(":")
+        chat_id = int(parts[1])
+
+        event = _discuss_cancels.get(chat_id)
+        if event:
+            event.set()
+            await query.edit_message_text("Cancel requested. Stopping after current step...")
+        else:
+            await query.edit_message_text("No active discussion to cancel.")
+    except Exception:
+        logger.exception("discuss cancel callback error")
+
+
+async def discuss_create_issues_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle [Create Issues] button press after discuss."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer("Creating issues...")
+
+    try:
+        data = query.data or ""
+        parts = data.split(":")
+        message_id = int(parts[1])
+
+        result = _discuss_results.get(message_id)
+        if not result:
+            await query.edit_message_text("Discussion expired. Please run /discuss again.")
+            return
+
+        # Remove button, show progress
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        settings: Settings = context.bot_data["settings"]
+        chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+        progress_msg = await context.bot.send_message(
+            chat_id, "Creating issues from discussion..."
+        )
+
+        async def progress_cb(status_text: str) -> None:
+            await _edit_msg(progress_msg, status_text)
+
+        created, total, issues_list = await step_discuss_to_issues(
+            project_name=result["project_name"],
+            github_user=result["github_user"],
+            project_path=result["project_path"],
+            question=result["question"],
+            discussion_text=result["response"],
+            settings=settings,
+            progress_cb=progress_cb,
+        )
+
+        # Show results
+        issue_lines = []
+        for iss in issues_list:
+            url = iss.get("url", "")
+            title = iss.get("title", "")
+            if url:
+                issue_lines.append(f"  - <a href=\"{url}\">{html.escape(title)}</a>")
+            else:
+                issue_lines.append(f"  - {html.escape(title)}")
+        issues_text = "\n".join(issue_lines) if issue_lines else "  (none)"
+
+        await _edit_msg(
+            progress_msg,
+            f"\u2705 Issues created: {created}/{total}\n\n{issues_text}",
+        )
+
+        # Cleanup
+        _discuss_results.pop(message_id, None)
+
+    except Exception as exc:
+        logger.exception("discuss create issues callback error")
+        try:
+            chat_id = update.effective_chat.id  # type: ignore[union-attr]
+            await context.bot.send_message(
+                chat_id, f"\u274c Error creating issues: {html.escape(str(exc)[:200])}"
+            )
+        except Exception:
+            pass
+
+
 # ── /help ────────────────────────────────────────────────────────────────────
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1952,9 +2475,11 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "\n"
         "/projects — List registered projects\n"
         "/init [--public] &lt;name&gt; &lt;desc&gt; — Bootstrap a new project\n"
+        "/plan &lt;project&gt; — Plan new development issues\n"
         "/issues &lt;project&gt; — Open GitHub issues (with Solve buttons)\n"
         "/solve &lt;project&gt; &lt;#&gt; [#...] — Auto-solve issues via Claude\n"
         "/rebase &lt;project&gt; &lt;pr#&gt; — Rebase PR onto latest main\n"
+        "/discuss &lt;project&gt; &lt;question&gt; — Technical consultation with Opus\n"
         "/extract &lt;project&gt; &lt;file&gt; — Generate training data from file\n"
         "\n"
         "/help — This message"
