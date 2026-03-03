@@ -1,4 +1,8 @@
-"""Triple-Model Pipeline: DeepSeek Design → Qwen Pre-Implement → Claude Implement → Claude Review → DeepSeek Audit → Data Mining."""
+"""Triple-Model Pipeline (legacy) and Five-brid 9-Step Pipeline.
+
+Legacy: DeepSeek Design → Qwen Pre-Implement → Claude Implement → Claude Review → DeepSeek Audit → Data Mining.
+Fivebrid: Haiku Research → Opus Design → Gemini Critique → Qwen Hints → Sonnet Implement → Sonnet Self-Review → Gemini Cross-Review → DeepSeek Audit → Data Mining.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from typing import Awaitable, Callable
 
 from .ai.base import AIResponse, Message, Role
 from .ai.anthropic_provider import AnthropicProvider
+from .ai.gemini_provider import GeminiCLIProvider
 from .ai.ollama_provider import OllamaProvider
 from .config import Settings
 from .security import mask_secrets
@@ -52,13 +57,14 @@ class PipelineContext:
     retry_count: int = 0
     review_feedback: str = ""
     review_passed: bool = False
-    steps: list[PipelineStep] = field(default_factory=lambda: [
-        PipelineStep(name="DeepSeek Design"),
-        PipelineStep(name="Qwen Pre-Implement"),
-        PipelineStep(name="Claude Implement"),
-        PipelineStep(name="Claude Review"),
-        PipelineStep(name="DeepSeek Audit"),
-    ])
+    # Fivebrid pipeline fields
+    research_log: str = ""
+    gemini_design_critique: str = ""
+    design_iteration: int = 0
+    self_review_report: str = ""
+    gemini_cross_review: str = ""
+    impl_snapshot_ref: str = ""
+    steps: list[PipelineStep] = field(default_factory=list)
 
 
 # ── Verdict Parsing ──────────────────────────────────────────────────────────
@@ -74,6 +80,16 @@ def parse_verdict(text: str) -> bool | None:
 def parse_final(text: str) -> bool | None:
     """Extract [FINAL: APPROVED] or [FINAL: REJECTED] from response (last match wins)."""
     matches = list(re.finditer(r"\[FINAL:\s*(APPROVED|REJECTED)\]", text, re.IGNORECASE))
+    if matches:
+        return matches[-1].group(1).upper() == "APPROVED"
+    return None
+
+
+def parse_design_verdict(text: str) -> bool | None:
+    """Extract [DESIGN: APPROVED] or [DESIGN: NEEDS_REVISION] (last match wins, case-insensitive)."""
+    matches = list(re.finditer(
+        r"\[DESIGN:\s*(APPROVED|NEEDS_REVISION)\]", text, re.IGNORECASE,
+    ))
     if matches:
         return matches[-1].group(1).upper() == "APPROVED"
     return None
@@ -148,6 +164,83 @@ async def _call_ollama_with_progress(
             system_prompt=system_prompt,
             timeout=timeout,
             model=model,
+        )
+    )
+    elapsed = 0
+    while not task.done():
+        await asyncio.sleep(10)
+        elapsed += 10
+        mins, secs = divmod(elapsed, 60)
+        await progress_cb(f"{step_name} (Thinking... {mins}m {secs}s)")
+    return task.result()
+
+
+# ── Claude CLI Progress Helper ───────────────────────────────────────────────
+
+async def _call_claude_cli_with_progress(
+    prompt: str,
+    *,
+    model: str,
+    timeout: int,
+    progress_cb: ProgressCallback,
+    step_name: str,
+    cwd: str | None = None,
+    dangerously_skip_permissions: bool = False,
+) -> str:
+    """Call Claude CLI with periodic progress updates. Returns the text output."""
+    cmd = ["claude", "-p", "--model", model, "--output-format", "text"]
+    if dangerously_skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+
+    async def _communicate() -> tuple[bytes, bytes]:
+        return await proc.communicate(input=prompt.encode())
+
+    task = asyncio.create_task(_communicate())
+    elapsed = 0
+    while not task.done():
+        await asyncio.sleep(10)
+        elapsed += 10
+        mins, secs = divmod(elapsed, 60)
+        await progress_cb(f"{step_name} (Thinking... {mins}m {secs}s)")
+
+    stdout, stderr = await asyncio.wait_for(task, timeout=timeout)
+    output = stdout.decode(errors="replace") if stdout else ""
+
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace") if stderr else ""
+        raise RuntimeError(f"Claude CLI failed (exit={proc.returncode}): {err[:300]}")
+
+    if not output.strip():
+        raise RuntimeError("Claude CLI returned empty response")
+
+    return output
+
+
+# ── Gemini CLI Progress Helper ───────────────────────────────────────────────
+
+async def _call_gemini_with_progress(
+    gemini: GeminiCLIProvider,
+    messages: list[Message],
+    *,
+    system_prompt: str,
+    timeout: int,
+    progress_cb: ProgressCallback,
+    step_name: str,
+) -> AIResponse:
+    """Call Gemini CLI with periodic progress updates."""
+    task = asyncio.create_task(
+        gemini.chat(
+            messages,
+            system_prompt=system_prompt,
+            timeout=timeout,
         )
     )
     elapsed = 0
@@ -668,7 +761,556 @@ def _write_training_data(ctx: PipelineContext, settings: Settings) -> tuple[int,
     return len(valid_lines), dropped
 
 
-# ── Orchestrator ─────────────────────────────────────────────────────────────
+# ── Fivebrid Step Functions ───────────────────────────────────────────────────
+
+async def step_haiku_research(
+    ctx: PipelineContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 0,
+) -> None:
+    """Step 0: Haiku CLI investigates the issue and explores existing code patterns."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    prompt = (
+        f"You are a research assistant preparing context for a senior engineer.\n\n"
+        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
+        f"Tasks:\n"
+        f"1. Summarize the issue requirements clearly.\n"
+        f"2. Identify which files, modules, and patterns in this project are most relevant.\n"
+        f"3. Note any existing similar patterns in the codebase that could be reused.\n"
+        f"4. Flag potential pitfalls or edge cases.\n\n"
+        f"Be concise and actionable. Focus on facts, not opinions."
+    )
+
+    try:
+        output = await _call_claude_cli_with_progress(
+            prompt,
+            model=settings.haiku_model,
+            timeout=settings.research_timeout,
+            progress_cb=progress_cb,
+            step_name="Haiku Research",
+            cwd=ctx.project_path,
+        )
+        ctx.research_log = output
+        step.status = "passed"
+        step.detail = f"{len(output)} chars"
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = str(exc)[:200]
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def step_opus_design(
+    ctx: PipelineContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 1,
+) -> None:
+    """Step 1: Opus CLI creates a detailed implementation design document."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    critique_section = ""
+    if ctx.gemini_design_critique:
+        critique_section = (
+            f"\n\n--- Previous Design Critique (from Gemini) ---\n"
+            f"{ctx.gemini_design_critique}\n---\n"
+            f"Address ALL issues raised in the critique above.\n"
+        )
+
+    prompt = (
+        f"You are a senior architect creating a detailed implementation plan.\n\n"
+        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
+        f"--- Research Context ---\n{ctx.research_log}\n---\n"
+        f"{critique_section}\n"
+        f"Create a comprehensive design document including:\n"
+        f"1. Files to create/modify with exact paths\n"
+        f"2. Detailed implementation steps with code structure\n"
+        f"3. Data flow and component interactions\n"
+        f"4. Edge cases and error handling strategy\n"
+        f"5. Testing approach\n\n"
+        f"Be specific and actionable — this document will guide the implementation directly."
+    )
+
+    try:
+        output = await _call_claude_cli_with_progress(
+            prompt,
+            model=settings.opus_model,
+            timeout=settings.opus_design_timeout,
+            progress_cb=progress_cb,
+            step_name="Opus Design",
+            cwd=ctx.project_path,
+        )
+        ctx.design_doc = output
+        step.status = "passed"
+        step.detail = f"{len(output)} chars"
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = str(exc)[:200]
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def step_gemini_design_critique(
+    ctx: PipelineContext,
+    gemini: GeminiCLIProvider,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 2,
+) -> None:
+    """Step 2: Gemini critiques the design. Non-fatal — APPROVED if verdict missing or error."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    system_prompt = (
+        "You are a design reviewer. Evaluate the implementation plan critically. "
+        "Check for: architectural soundness, missing edge cases, security concerns, "
+        "and adherence to the issue requirements."
+    )
+    user_content = (
+        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
+        f"--- Research Context ---\n{ctx.research_log}\n\n"
+        f"--- Design Document ---\n{ctx.design_doc}\n\n"
+        f"Review this design. End your review with exactly one of:\n"
+        f"[DESIGN: APPROVED] — if the design is solid\n"
+        f"[DESIGN: NEEDS_REVISION] — if there are critical issues\n\n"
+        f"If NEEDS_REVISION, clearly list what must be changed."
+    )
+
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    try:
+        response = await _call_gemini_with_progress(
+            gemini, messages,
+            system_prompt=system_prompt,
+            timeout=settings.gemini_critique_timeout,
+            progress_cb=progress_cb,
+            step_name="Gemini Design Critique",
+        )
+        ctx.gemini_design_critique = response.content
+        verdict = parse_design_verdict(response.content)
+
+        if verdict is True:
+            step.status = "passed"
+            step.detail = "DESIGN: APPROVED"
+        elif verdict is False:
+            step.status = "failed"
+            step.detail = "DESIGN: NEEDS_REVISION"
+        else:
+            # No verdict tag found — treat as APPROVED to prevent infinite loop
+            step.status = "passed"
+            step.detail = "No verdict tag — treated as APPROVED"
+            logger.warning("Gemini design critique returned no verdict tag, treating as APPROVED")
+    except Exception as exc:
+        # Non-fatal: proceed with current design
+        step.status = "skipped"
+        step.detail = f"Non-fatal: {str(exc)[:150]}"
+        logger.warning("Gemini design critique failed (non-fatal): %s", exc)
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def step_sonnet_self_review(
+    ctx: PipelineContext,
+    settings: Settings,
+    cancel_event: asyncio.Event,
+    progress_cb: ProgressCallback,
+    step_index: int = 5,
+) -> None:
+    """Step 5: Sonnet self-reviews and fixes its own implementation. Safe-fail with snapshot recovery."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    prompt = (
+        f"You are reviewing code you just wrote for GitHub issue #{ctx.issue_num}.\n\n"
+        f"--- Issue ---\n{ctx.issue_body}\n\n"
+        f"--- Design Document ---\n{ctx.design_doc}\n\n"
+        f"--- Current Git Diff ---\n{ctx.git_diff}\n\n"
+        f"Tasks:\n"
+        f"1. Review your implementation for bugs, missing edge cases, and code quality issues.\n"
+        f"2. Fix any issues you find directly in the code files.\n"
+        f"3. Run the project's compile/build command to verify no errors.\n"
+        f"4. Fix any compile errors.\n\n"
+        f"GIT RESTRICTIONS:\n"
+        f"- Do NOT create branches, push, or create PRs.\n"
+        f"- Only modify files and commit locally."
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", "--model", settings.sonnet_model,
+            "--output-format", "text", "--dangerously-skip-permissions",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=ctx.project_path,
+        )
+
+        async def _communicate() -> tuple[bytes, bytes]:
+            return await proc.communicate(input=prompt.encode())
+
+        comm_task = asyncio.create_task(_communicate())
+        elapsed = 0
+        while not comm_task.done():
+            await asyncio.sleep(10)
+            elapsed += 10
+            if cancel_event.is_set():
+                proc.kill()
+                await comm_task
+                raise asyncio.CancelledError("Cancelled by user")
+            mins, secs = divmod(elapsed, 60)
+            await progress_cb(f"Sonnet Self-Review [{mins}m {secs}s]")
+
+        stdout, stderr = await asyncio.wait_for(
+            comm_task, timeout=settings.sonnet_self_review_timeout,
+        )
+        output = stdout.decode(errors="replace") if stdout else ""
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"Sonnet self-review CLI failed (exit={proc.returncode})")
+
+        # Snapshot commit after self-review modifications
+        await _snapshot_commit(ctx.project_path, ctx.issue_num)
+
+        # Re-capture diff after self-review changes
+        ctx.git_diff = await _capture_filtered_diff(
+            ctx.project_path, base_ref=ctx.base_commit or "main",
+        )
+
+        ctx.self_review_report = output
+        step.status = "passed"
+        step.detail = f"Self-review complete, diff={len(ctx.git_diff)} chars"
+
+    except (asyncio.CancelledError, asyncio.TimeoutError) as exc:
+        # Safe-fail: recover snapshot
+        if ctx.impl_snapshot_ref:
+            logger.warning("Self-review %s — recovering snapshot %s",
+                           type(exc).__name__, ctx.impl_snapshot_ref[:8])
+            await _reset_to_snapshot(ctx.project_path, ctx.impl_snapshot_ref)
+            ctx.git_diff = await _capture_filtered_diff(
+                ctx.project_path, base_ref=ctx.base_commit or "main",
+            )
+        step.status = "skipped"
+        step.detail = f"Safe-fail: {type(exc).__name__}, snapshot recovered"
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+    except Exception as exc:
+        # Safe-fail: recover snapshot on any error
+        if ctx.impl_snapshot_ref:
+            logger.warning("Self-review error — recovering snapshot %s: %s",
+                           ctx.impl_snapshot_ref[:8], exc)
+            await _reset_to_snapshot(ctx.project_path, ctx.impl_snapshot_ref)
+            ctx.git_diff = await _capture_filtered_diff(
+                ctx.project_path, base_ref=ctx.base_commit or "main",
+            )
+        step.status = "skipped"
+        step.detail = f"Safe-fail: {str(exc)[:150]}, snapshot recovered"
+        logger.warning("Sonnet self-review failed (safe-fail): %s", exc)
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+async def step_gemini_cross_review(
+    ctx: PipelineContext,
+    gemini: GeminiCLIProvider,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 6,
+) -> None:
+    """Step 6: Gemini cross-reviews the implementation. Non-fatal — defaults to PASS."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    system_prompt = (
+        "You are a cross-reviewer examining an implementation from a different perspective. "
+        "Focus on business logic correctness, edge cases, and potential regressions."
+    )
+
+    review_context = ""
+    if ctx.self_review_report:
+        review_context = f"\n--- Self-Review Report ---\n{ctx.self_review_report}\n"
+
+    user_content = (
+        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
+        f"--- Design Document ---\n{ctx.design_doc}\n\n"
+        f"--- Git Diff ---\n{ctx.git_diff}\n"
+        f"{review_context}\n"
+        f"Review the implementation for:\n"
+        f"1. Business logic correctness\n"
+        f"2. Edge cases and error handling\n"
+        f"3. Potential regressions\n"
+        f"4. Code quality and maintainability\n\n"
+        f"End with exactly one of:\n"
+        f"[VERDICT: PASS] — if the implementation is acceptable\n"
+        f"[VERDICT: FAIL] — if there are critical issues"
+    )
+
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    try:
+        response = await _call_gemini_with_progress(
+            gemini, messages,
+            system_prompt=system_prompt,
+            timeout=settings.gemini_cross_review_timeout,
+            progress_cb=progress_cb,
+            step_name="Gemini Cross-Review",
+        )
+        ctx.gemini_cross_review = response.content
+        verdict = parse_verdict(response.content)
+
+        if verdict is True:
+            step.status = "passed"
+            step.detail = "VERDICT: PASS"
+        elif verdict is False:
+            step.status = "failed"
+            step.detail = "VERDICT: FAIL"
+            logger.warning("Gemini cross-review FAILED for issue #%d", ctx.issue_num)
+        else:
+            # No verdict — default to PASS (non-fatal)
+            step.status = "passed"
+            step.detail = "No verdict tag — treated as PASS"
+    except Exception as exc:
+        # Non-fatal: proceed to DeepSeek audit
+        step.status = "skipped"
+        step.detail = f"Non-fatal: {str(exc)[:150]}"
+        logger.warning("Gemini cross-review failed (non-fatal): %s", exc)
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+# ── Fivebrid Data Mining (Enhanced) ──────────────────────────────────────────
+
+async def step_data_mining_fivebrid(
+    ctx: PipelineContext,
+    ollama: OllamaProvider,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = -1,
+) -> None:
+    """Step 8: Enhanced data mining — bundles research + design + code as training data."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    system_prompt = (
+        "You are a training data generator. Create high-quality fine-tuning data. "
+        "Output JSONL (one JSON object per line). Each object must have exactly these keys: "
+        '"instruction" (background context + design intent summary + task), '
+        '"output" (the final code), '
+        '"metadata" (object with "issue" number and "project" name). '
+        "IMPORTANT: Compress unnecessary logs and intermediate steps. "
+        "The 'instruction' should clearly show the correlation between the design intent "
+        "and the final diff. Summarize the research background and design core intent concisely. "
+        "Output ONLY valid JSONL lines. No markdown fences. No explanations."
+    )
+    user_content = (
+        f"GitHub Issue #{ctx.issue_num} (project: {ctx.project_name}):\n{ctx.issue_body}\n\n"
+        f"--- Research Background ---\n{ctx.research_log}\n\n"
+        f"--- Design Document ---\n{ctx.design_doc}\n\n"
+        f"--- Final Git Diff ---\n{ctx.git_diff}\n\n"
+        "Generate instruction-output pairs as JSONL. Bundle the research background, "
+        "design intent, and final code into cohesive training examples."
+    )
+
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    try:
+        response = await _call_ollama_with_progress(
+            ollama, messages,
+            max_tokens=settings.data_mining_max_tokens,
+            temperature=0.3,
+            system_prompt=system_prompt,
+            timeout=settings.data_mining_timeout,
+            progress_cb=progress_cb,
+            step_name="Data Mining",
+            model=settings.qwen_coder_model,
+        )
+        ctx.data_mining_result = response.content
+        valid, dropped = _write_training_data(ctx, settings)
+        step.status = "passed"
+        step.detail = f"{valid} pairs saved, {dropped} dropped"
+    except Exception as exc:
+        step.status = "skipped"
+        step.detail = f"Non-fatal: {str(exc)[:150]}"
+        logger.warning("Data mining (fivebrid) failed (non-fatal): %s", exc)
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
+# ── Fivebrid Orchestrator ────────────────────────────────────────────────────
+
+async def run_fivebrid_pipeline(
+    ctx: PipelineContext,
+    ollama: OllamaProvider,
+    gemini: GeminiCLIProvider,
+    settings: Settings,
+    cancel_event: asyncio.Event,
+    progress_cb: ProgressCallback,
+) -> tuple[str, str]:
+    """Run the 9-step Five-brid pipeline. Returns (status, detail)."""
+
+    # Initialize fivebrid steps
+    if not ctx.steps:
+        ctx.steps = [
+            PipelineStep(name="Haiku Research"),        # 0
+            PipelineStep(name="Opus Design"),           # 1
+            PipelineStep(name="Gemini Design Critique"),# 2
+            PipelineStep(name="Qwen Hints"),            # 3
+            PipelineStep(name="Sonnet Implement"),      # 4
+            PipelineStep(name="Sonnet Self-Review"),    # 5
+            PipelineStep(name="Gemini Cross-Review"),   # 6
+            PipelineStep(name="DeepSeek Audit"),        # 7
+        ]
+
+    try:
+        # Fetch issue
+        await progress_cb("Fetching issue...")
+        await step_fetch_issue(ctx)
+
+        if cancel_event.is_set():
+            return "skipped", "Cancelled by user"
+
+        # ── Phase 0: Research ──
+        await progress_cb("[0/8] Haiku Research...")
+        await step_haiku_research(ctx, settings, progress_cb, step_index=0)
+
+        if cancel_event.is_set():
+            return "skipped", "Cancelled by user"
+
+        # ── Phase A: Design Loop ──
+        for iteration in range(settings.max_design_retries + 1):
+            ctx.design_iteration = iteration
+
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
+
+            # Step 1: Opus Design
+            step_label = f" (iteration {iteration + 1})" if iteration > 0 else ""
+            await progress_cb(f"[1/8] Opus Design{step_label}...")
+
+            if iteration > 0:
+                # Insert new design + critique step pairs after previous critique
+                # Previous critique is at index 2 + (iteration-1)*2
+                insert_at = 3 + (iteration - 1) * 2
+                ctx.steps.insert(insert_at, PipelineStep(name=f"Opus Design (retry {iteration})"))
+                ctx.steps.insert(insert_at + 1, PipelineStep(name=f"Gemini Critique (retry {iteration})"))
+
+            design_idx = 1 + (iteration * 2)
+            await step_opus_design(ctx, settings, progress_cb, step_index=design_idx)
+
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
+
+            # Step 2: Gemini Design Critique (non-fatal)
+            critique_idx = design_idx + 1
+            await progress_cb(f"[2/8] Gemini Design Critique{step_label}...")
+            await step_gemini_design_critique(
+                ctx, gemini, settings, progress_cb, step_index=critique_idx,
+            )
+
+            critique_step = ctx.steps[critique_idx]
+            # Check if critique says NEEDS_REVISION and we have retries left
+            if critique_step.status == "failed" and "NEEDS_REVISION" in critique_step.detail:
+                if iteration < settings.max_design_retries:
+                    await progress_cb(
+                        f"Design needs revision (iteration {iteration + 1}/{settings.max_design_retries + 1}), retrying..."
+                    )
+                    continue
+            # APPROVED, skipped, or no more retries — proceed
+            break
+
+        if cancel_event.is_set():
+            return "skipped", "Cancelled by user"
+
+        # ── Phase B: Implementation ──
+
+        # Find step indices dynamically (design loop may have added extra steps)
+        qwen_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Qwen Hints")
+        impl_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Implement")
+        self_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Self-Review")
+
+        # Step 3: Qwen Hints (non-fatal)
+        try:
+            await progress_cb("[3/8] Qwen Pre-Implement...")
+            await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=qwen_idx)
+        except Exception as exc:
+            logger.warning("Qwen pre-implement failed (non-fatal): %s", exc)
+
+        if cancel_event.is_set():
+            return "skipped", "Cancelled by user"
+
+        # Step 4: Sonnet Implement (uses existing step_claude_implement)
+        await progress_cb("[4/8] Sonnet Implement...")
+        await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
+
+        # Capture snapshot ref for safe-fail recovery
+        snap_proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "HEAD",
+            cwd=ctx.project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        snap_out, _ = await asyncio.wait_for(snap_proc.communicate(), timeout=5)
+        ctx.impl_snapshot_ref = snap_out.decode().strip() if snap_out else ""
+
+        if cancel_event.is_set():
+            return "skipped", "Cancelled by user"
+
+        # Step 5: Sonnet Self-Review (safe-fail)
+        await progress_cb("[5/8] Sonnet Self-Review...")
+        await step_sonnet_self_review(ctx, settings, cancel_event, progress_cb, step_index=self_review_idx)
+
+        if cancel_event.is_set():
+            return "skipped", "Cancelled by user"
+
+        # ── Phase C: Audit ──
+        cross_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Gemini Cross-Review")
+        audit_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "DeepSeek Audit")
+
+        # Step 6: Gemini Cross-Review (non-fatal)
+        await progress_cb("[6/8] Gemini Cross-Review...")
+        await step_gemini_cross_review(ctx, gemini, settings, progress_cb, step_index=cross_review_idx)
+
+        if cancel_event.is_set():
+            return "skipped", "Cancelled by user"
+
+        # Step 7: DeepSeek Audit (fatal)
+        await progress_cb("[7/8] DeepSeek Audit...")
+        # Populate review_report for DeepSeek audit prompt (uses gemini cross-review as peer review)
+        ctx.review_report = ctx.gemini_cross_review or ctx.self_review_report or "(no review available)"
+        await step_deepseek_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
+
+        # ── Phase D: Post-Process ──
+        if settings.enable_data_mining and ctx.audit_passed:
+            ctx.steps.append(PipelineStep(name="Data Mining"))
+            try:
+                await progress_cb("[8/8] Data Mining...")
+                await step_data_mining_fivebrid(ctx, ollama, settings, progress_cb, step_index=-1)
+            except Exception as exc:
+                logger.warning("Data mining step failed (non-fatal): %s", exc)
+
+        return "success", "All checks passed"
+
+    except asyncio.CancelledError:
+        return "skipped", "Cancelled by user"
+    except Exception as exc:
+        for s in ctx.steps:
+            if s.status == "failed":
+                return "failed", f"{s.name}: {s.detail}"
+        return "failed", str(exc)[:200]
+
+
+# ── Legacy Orchestrator ──────────────────────────────────────────────────────
 
 async def run_dual_check_pipeline(
     ctx: PipelineContext,
@@ -680,6 +1322,16 @@ async def run_dual_check_pipeline(
 ) -> tuple[str, str]:
     """Run the full 5-step pipeline with automatic retry on review failure. Returns (status, detail)."""
     max_retries = settings.max_review_retries
+
+    # Initialize steps if empty (default_factory is now list)
+    if not ctx.steps:
+        ctx.steps = [
+            PipelineStep(name="DeepSeek Design"),
+            PipelineStep(name="Qwen Pre-Implement"),
+            PipelineStep(name="Claude Implement"),
+            PipelineStep(name="Claude Review"),
+            PipelineStep(name="DeepSeek Audit"),
+        ]
 
     try:
         # Fetch issue
@@ -775,6 +1427,17 @@ async def run_dual_check_pipeline(
 
 
 # ── Internal Helpers ─────────────────────────────────────────────────────────
+
+async def _reset_to_snapshot(project_path: str, snapshot_ref: str) -> None:
+    """Reset worktree to a specific commit snapshot (safe-fail recovery)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "reset", "--hard", snapshot_ref,
+        cwd=project_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=15)
+
 
 def _shell_quote(s: str) -> str:
     """Quote a string for safe shell use (single-quote wrapping)."""

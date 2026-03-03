@@ -49,6 +49,31 @@ class Settings(BaseSettings):
     data_mining_max_tokens: int = 4096
     training_data_dir: str = ""            # Empty = default to ai-orchestrator/data/training/
 
+    # Five-brid Pipeline
+    pipeline_mode: str = "legacy"          # "legacy" | "fivebrid"
+
+    # Gemini
+    gemini_model: str = "gemini-2.5-pro"
+
+    # Phase 0: Research (Haiku CLI)
+    haiku_model: str = "claude-haiku-4-5-20251001"
+    research_timeout: int = 120
+    research_max_tokens: int = 4096
+
+    # Phase A: Design (Opus CLI + Gemini critique)
+    opus_model: str = "claude-opus-4-6"
+    opus_design_timeout: int = 900         # 15 min
+    opus_design_max_tokens: int = 16384
+    gemini_critique_timeout: int = 600     # 10 min
+    max_design_retries: int = 2
+
+    # Phase B: Self-Review (Sonnet CLI)
+    sonnet_model: str = "claude-sonnet-4-6"
+    sonnet_self_review_timeout: int = 600  # 10 min
+
+    # Phase C: Cross-Review (Gemini CLI)
+    gemini_cross_review_timeout: int = 600  # 10 min
+
 
 def load_projects() -> dict[str, dict]:
     """Read projects.json and return {name: {path: ...}} with expanded paths."""
