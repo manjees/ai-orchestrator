@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     # Phase C: Cross-Review (Gemini CLI)
     gemini_cross_review_timeout: int = 600  # 10 min
 
+    # Service
+    launchd_label: str = "com.ai-orchestrator"
+
     # Init Pipeline
     projects_base_dir: str = "~/Desktop/dev"
     github_user: str = ""

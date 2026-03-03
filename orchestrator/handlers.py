@@ -340,7 +340,7 @@ async def process_callback_handler(
 
 # ── /service ─────────────────────────────────────────────────────────────────
 
-_LAUNCHD_LABEL = os.environ.get("LAUNCHD_LABEL", "com.ai-orchestrator")
+_LAUNCHD_LABEL = "com.ai-orchestrator"
 _PLIST_PATH = os.path.expanduser(
     f"~/Library/LaunchAgents/{_LAUNCHD_LABEL}.plist"
 )
