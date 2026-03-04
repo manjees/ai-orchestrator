@@ -2013,6 +2013,66 @@ async def step_init_issue_planning(
 # ── Plan & Discuss Pipeline Functions ────────────────────────────────────────
 
 
+def _extract_json_array(text: str) -> list[dict] | None:
+    """Extract a JSON array from LLM output with multiple fallback strategies."""
+    # 1. Strip markdown fences
+    cleaned = re.sub(r"```(?:json)?\s*\n?", "", text)
+    cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+
+    # 2. Try direct parse
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Bracket matching (first [ to last ])
+    start_idx = cleaned.find("[")
+    end_idx = cleaned.rfind("]")
+    if start_idx != -1 and end_idx > start_idx:
+        try:
+            parsed = json.loads(cleaned[start_idx:end_idx + 1])
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # 4. Balanced bracket extraction — find the [ that properly closes
+    if start_idx != -1:
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start_idx, len(cleaned)):
+            ch = cleaned[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\":
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(cleaned[start_idx:i + 1])
+                        if isinstance(parsed, list):
+                            return parsed
+                    except json.JSONDecodeError:
+                        pass
+                    break
+
+    logger.warning("JSON extraction failed. First 500 chars: %s", cleaned[:500])
+    return None
+
+
 async def _ensure_labels_and_create_issues(
     issues: list[dict],
     github_user: str,
@@ -2122,28 +2182,8 @@ async def step_plan_issues(
         step_name="Issue Planning",
     )
 
-    # Extract JSON array from output (robust: markdown removal → direct parse → bracket matching)
-    cleaned = re.sub(r"```(?:json)?\s*\n?", "", output)
-    cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
-
-    issues = None
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, list):
-            issues = parsed
-    except json.JSONDecodeError:
-        pass
-
-    if issues is None:
-        start_idx = cleaned.find("[")
-        end_idx = cleaned.rfind("]")
-        if start_idx != -1 and end_idx > start_idx:
-            try:
-                issues = json.loads(cleaned[start_idx:end_idx + 1])
-            except json.JSONDecodeError:
-                pass
-
-    if not issues or not isinstance(issues, list):
+    issues = _extract_json_array(output)
+    if not issues:
         raise RuntimeError(f"Could not extract JSON array from Opus output ({len(output)} chars)")
 
     return await _ensure_labels_and_create_issues(issues, github_user, project_name)
@@ -2220,28 +2260,8 @@ async def step_discuss_to_issues(
         step_name="Discussion → Issues",
     )
 
-    # Extract JSON array
-    cleaned = re.sub(r"```(?:json)?\s*\n?", "", output)
-    cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
-
-    issues = None
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, list):
-            issues = parsed
-    except json.JSONDecodeError:
-        pass
-
-    if issues is None:
-        start_idx = cleaned.find("[")
-        end_idx = cleaned.rfind("]")
-        if start_idx != -1 and end_idx > start_idx:
-            try:
-                issues = json.loads(cleaned[start_idx:end_idx + 1])
-            except json.JSONDecodeError:
-                pass
-
-    if not issues or not isinstance(issues, list):
+    issues = _extract_json_array(output)
+    if not issues:
         raise RuntimeError(f"Could not extract JSON array from Opus output ({len(output)} chars)")
 
     return await _ensure_labels_and_create_issues(issues, github_user, project_name)
