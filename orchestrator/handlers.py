@@ -817,6 +817,8 @@ async def _solve_single_issue(
 ) -> tuple[str, str]:
     """Solve one issue. Routes to fivebrid, dual-check, or direct-claude based on settings."""
     settings = context.bot_data["settings"]
+    projects: dict = context.bot_data.get("projects", {})
+    project_info = projects.get(project_name, {})
 
     if settings.pipeline_mode == "fivebrid":
         ollama: OllamaProvider | None = context.bot_data.get("ollama")
@@ -829,6 +831,7 @@ async def _solve_single_issue(
             context, chat_id, project_name, project_path,
             issue_num, timeout, cancel_event,
             ollama, gemini, settings,
+            project_info=project_info,
         )
     elif settings.dual_check_enabled:
         ollama = context.bot_data.get("ollama")
@@ -839,6 +842,7 @@ async def _solve_single_issue(
             context, chat_id, project_name, project_path,
             issue_num, timeout, cancel_event,
             ollama, anthropic, settings,
+            project_info=project_info,
         )
     else:
         return await _solve_direct_claude(
@@ -858,8 +862,9 @@ async def _solve_with_dual_check(
     ollama: OllamaProvider,
     anthropic: AnthropicProvider | None,
     settings,
+    project_info: dict | None = None,
 ) -> tuple[str, str]:
-    """Solve via 4-step dual-check pipeline."""
+    """Solve via dual-check pipeline."""
     branch_name = f"solve/issue-{issue_num}"
 
     cancel_btn = InlineKeyboardMarkup([
@@ -926,6 +931,7 @@ async def _solve_with_dual_check(
         # Run pipeline
         status, detail = await run_dual_check_pipeline(
             ctx, ollama, anthropic, settings, cancel_event, progress_cb,
+            project_info=project_info,
         )
 
         elapsed = int(time.monotonic() - pipeline_start)
@@ -992,8 +998,9 @@ async def _solve_with_fivebrid(
     ollama: OllamaProvider,
     gemini: GeminiCLIProvider,
     settings,
+    project_info: dict | None = None,
 ) -> tuple[str, str]:
-    """Solve via 9-step Five-brid pipeline."""
+    """Solve via Five-brid pipeline."""
     branch_name = f"solve/issue-{issue_num}"
 
     cancel_btn = InlineKeyboardMarkup([
@@ -1060,6 +1067,7 @@ async def _solve_with_fivebrid(
         # Run fivebrid pipeline
         status, detail = await run_fivebrid_pipeline(
             ctx, ollama, gemini, settings, cancel_event, progress_cb,
+            project_info=project_info,
         )
 
         elapsed = int(time.monotonic() - pipeline_start)
@@ -1717,7 +1725,7 @@ async def extract_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             temperature=0.3,
             system_prompt=system_prompt,
             timeout=settings.data_mining_timeout,
-            model=settings.qwen_coder_model,
+            model=settings.qwen_model,
         )
 
         result = response.content.strip()
@@ -2119,6 +2127,7 @@ async def _run_plan(
             )
             await _edit_msg(msg, text, reply_markup=cancel_btn)
 
+        ollama: OllamaProvider = context.bot_data["ollama"]
         created, total, issues_list = await step_plan_issues(
             project_name=project_name,
             project_path=project_path,
@@ -2127,6 +2136,7 @@ async def _run_plan(
             claude_md=claude_md,
             settings=settings,
             progress_cb=progress_cb,
+            ollama=ollama,
         )
 
         # 5. Report results
@@ -2349,6 +2359,7 @@ async def _run_discuss(
             )
             await _edit_msg(msg, text, reply_markup=cancel_btn)
 
+        ollama: OllamaProvider = context.bot_data["ollama"]
         response = await step_discuss_consult(
             project_name=project_name,
             claude_md=claude_md,
@@ -2357,6 +2368,7 @@ async def _run_discuss(
             question=question,
             settings=settings,
             progress_cb=progress_cb,
+            ollama=ollama,
         )
 
         # 6. Send response in chunks
@@ -2413,7 +2425,7 @@ async def _run_discuss(
                 f"## Response\n{response}\n\n"
                 f"## Metadata\n"
                 f"- Date: {date.today().isoformat()}\n"
-                f"- Model: opus\n"
+                f"- Model: qwen\n"
             )
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -2483,6 +2495,7 @@ async def discuss_create_issues_callback(update: Update, context: ContextTypes.D
         async def progress_cb(status_text: str) -> None:
             await _edit_msg(progress_msg, status_text)
 
+        ollama: OllamaProvider = context.bot_data["ollama"]
         created, total, issues_list = await step_discuss_to_issues(
             project_name=result["project_name"],
             github_user=result["github_user"],
@@ -2491,6 +2504,7 @@ async def discuss_create_issues_callback(update: Update, context: ContextTypes.D
             discussion_text=result["response"],
             settings=settings,
             progress_cb=progress_cb,
+            ollama=ollama,
         )
 
         # Show results

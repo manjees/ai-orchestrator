@@ -64,6 +64,7 @@ class PipelineContext:
     self_review_report: str = ""
     gemini_cross_review: str = ""
     impl_snapshot_ref: str = ""
+    ci_check_log: str = ""
     steps: list[PipelineStep] = field(default_factory=list)
 
 
@@ -105,6 +106,172 @@ DIFF_EXCLUDE_PATTERNS = [
 ]
 
 _MAX_DIFF_CHARS = 50_000
+_MAX_CI_LOG_CHARS = 3_000
+
+
+def detect_ci_commands(project_path: str) -> list[str]:
+    """Auto-detect build/lint/test commands based on project files."""
+    p = Path(project_path)
+
+    # Gradle (KMP, Android, JVM)
+    if (p / "gradlew").exists():
+        return ["./gradlew check"]
+
+    # Node.js
+    pkg_json = p / "package.json"
+    if pkg_json.exists():
+        try:
+            scripts = json.loads(pkg_json.read_text()).get("scripts", {})
+            cmds: list[str] = []
+            for key in ("lint", "build", "test"):
+                if key in scripts:
+                    cmds.append(f"npm run {key}")
+            return cmds if cmds else []
+        except Exception:
+            return []
+
+    # Python
+    if (p / "pyproject.toml").exists():
+        cmds = []
+        toml_text = (p / "pyproject.toml").read_text()
+        if "ruff" in toml_text:
+            cmds.append("ruff check .")
+        if "mypy" in toml_text:
+            cmds.append("mypy .")
+        if "pytest" in toml_text or (p / "tests").is_dir():
+            cmds.append("pytest")
+        return cmds if cmds else []
+
+    # Rust
+    if (p / "Cargo.toml").exists():
+        return ["cargo build", "cargo test"]
+
+    # Go
+    if (p / "go.mod").exists():
+        return ["go build ./...", "go test ./..."]
+
+    return []
+
+
+def _resolve_ci_commands(project_path: str, project_info: dict | None) -> list[str]:
+    """Return CI commands: explicit from project_info if set, else auto-detect."""
+    if project_info and "ci_commands" in project_info:
+        return list(project_info["ci_commands"])
+    return detect_ci_commands(project_path)
+
+
+async def _run_local_ci(
+    project_path: str,
+    commands: list[str],
+    timeout: int,
+) -> tuple[bool, str]:
+    """Run CI commands sequentially. Return (success, log). Stop on first failure."""
+    full_log = ""
+    for cmd in commands:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=project_path,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            output = stdout.decode(errors="replace") if stdout else ""
+            full_log += f"$ {cmd}\n{output}\n"
+            if proc.returncode != 0:
+                # Truncate to tail
+                if len(full_log) > _MAX_CI_LOG_CHARS:
+                    full_log = f"...(truncated)\n{full_log[-_MAX_CI_LOG_CHARS:]}"
+                return False, full_log
+        except asyncio.TimeoutError:
+            full_log += f"$ {cmd}\n[TIMEOUT after {timeout}s]\n"
+            if len(full_log) > _MAX_CI_LOG_CHARS:
+                full_log = f"...(truncated)\n{full_log[-_MAX_CI_LOG_CHARS:]}"
+            return False, full_log
+
+    if len(full_log) > _MAX_CI_LOG_CHARS:
+        full_log = f"...(truncated)\n{full_log[-_MAX_CI_LOG_CHARS:]}"
+    return True, full_log
+
+
+async def step_local_ci_check(
+    ctx: PipelineContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    ci_commands: list[str],
+    step_index: int,
+) -> None:
+    """Run local CI commands and auto-fix with Sonnet on failure."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+    max_retries = settings.local_ci_fix_retries
+
+    try:
+        for attempt in range(max_retries + 1):
+            attempt_label = f" (attempt {attempt + 1}/{max_retries + 1})" if attempt > 0 else ""
+            await progress_cb(f"Local CI Check{attempt_label}...")
+
+            success, log = await _run_local_ci(
+                ctx.project_path, ci_commands, settings.local_ci_timeout,
+            )
+            ctx.ci_check_log = log
+
+            if success:
+                step.status = "passed"
+                step.detail = "CI passed"
+                return
+
+            # Failed — try auto-fix if retries remain
+            if attempt < max_retries:
+                await progress_cb(f"Local CI Check — fixing (attempt {attempt + 1})...")
+                fix_prompt = (
+                    f"You are a Senior Engineer. Fix the following build/test error "
+                    f"while maintaining the architectural integrity defined in CLAUDE.md.\n\n"
+                    f"Read .claude/CLAUDE.md first to understand the project conventions.\n\n"
+                    f"Failed commands:\n{', '.join(ci_commands)}\n\n"
+                    f"--- Error Log ---\n{log}\n---\n\n"
+                    f"Fix the errors in the source files. Do NOT create commits or push.\n"
+                    f"Do NOT create branches. Only modify the files to fix the errors."
+                )
+                try:
+                    await _call_claude_cli_with_progress(
+                        fix_prompt,
+                        model=settings.sonnet_model,
+                        timeout=settings.local_ci_fix_timeout,
+                        progress_cb=progress_cb,
+                        step_name="CI Fix",
+                        cwd=ctx.project_path,
+                        dangerously_skip_permissions=True,
+                    )
+                    # Snapshot commit so changes are visible in diff
+                    await _snapshot_commit(ctx.project_path, ctx.issue_num)
+                    # Update diff
+                    ctx.git_diff = await _capture_filtered_diff(
+                        ctx.project_path, base_ref=ctx.base_commit or "main",
+                    )
+                except Exception as fix_exc:
+                    logger.warning("CI auto-fix attempt %d failed: %s", attempt + 1, fix_exc)
+            else:
+                # No retries left
+                if settings.local_ci_fatal:
+                    step.status = "failed"
+                    step.detail = f"CI failed after {max_retries + 1} attempts"
+                    raise RuntimeError(step.detail)
+                else:
+                    step.status = "skipped"
+                    step.detail = f"CI failed (non-fatal, {max_retries + 1} attempts)"
+                    logger.warning("Local CI check failed but non-fatal for issue #%d", ctx.issue_num)
+                    return
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        step.status = "skipped"
+        step.detail = f"Non-fatal: {str(exc)[:150]}"
+        logger.warning("Local CI check error (non-fatal): %s", exc)
+    finally:
+        step.elapsed_sec = time.monotonic() - start
 
 
 async def _capture_filtered_diff(project_path: str, base_ref: str = "main") -> str:
@@ -154,6 +321,7 @@ async def _call_ollama_with_progress(
     progress_cb: ProgressCallback,
     step_name: str,
     model: str | None = None,
+    num_ctx: int | None = None,
 ) -> AIResponse:
     """Call an Ollama model with periodic 'Thinking...' progress updates."""
     task = asyncio.create_task(
@@ -164,6 +332,7 @@ async def _call_ollama_with_progress(
             system_prompt=system_prompt,
             timeout=timeout,
             model=model,
+            num_ctx=num_ctx,
         )
     )
     elapsed = 0
@@ -314,6 +483,7 @@ async def step_deepseek_design(
             timeout=settings.deepseek_design_timeout,
             progress_cb=progress_cb,
             step_name="DeepSeek Design",
+            model=settings.reasoning_model,
         )
         ctx.design_doc = response.content
         step.status = "passed"
@@ -361,7 +531,7 @@ async def step_qwen_pre_implement(
             timeout=settings.qwen_impl_timeout,
             progress_cb=progress_cb,
             step_name="Qwen Pre-Implement",
-            model=settings.qwen_coder_model,
+            model=settings.qwen_model,
         )
         ctx.qwen_hints = response.content
         step.status = "passed"
@@ -640,6 +810,7 @@ async def step_deepseek_audit(
             timeout=settings.deepseek_audit_timeout,
             progress_cb=progress_cb,
             step_name="DeepSeek Audit",
+            model=settings.reasoning_model,
         )
         ctx.audit_result = response.content
         verdict = parse_final(response.content)
@@ -704,7 +875,7 @@ async def step_data_mining(
             timeout=settings.data_mining_timeout,
             progress_cb=progress_cb,
             step_name="Data Mining",
-            model=settings.qwen_coder_model,
+            model=settings.qwen_model,
         )
         ctx.data_mining_result = response.content
         valid, dropped = _write_training_data(ctx, settings)
@@ -1140,7 +1311,7 @@ async def step_data_mining_fivebrid(
             timeout=settings.data_mining_timeout,
             progress_cb=progress_cb,
             step_name="Data Mining",
-            model=settings.qwen_coder_model,
+            model=settings.qwen_model,
         )
         ctx.data_mining_result = response.content
         valid, dropped = _write_training_data(ctx, settings)
@@ -1163,32 +1334,43 @@ async def run_fivebrid_pipeline(
     settings: Settings,
     cancel_event: asyncio.Event,
     progress_cb: ProgressCallback,
+    project_info: dict | None = None,
 ) -> tuple[str, str]:
-    """Run the 9-step Five-brid pipeline. Returns (status, detail)."""
+    """Run the 9-step Five-brid pipeline (10 with Local CI Check). Returns (status, detail)."""
+
+    # Resolve CI commands once at start
+    ci_commands = _resolve_ci_commands(ctx.project_path, project_info) if settings.local_ci_enabled else []
 
     # Initialize fivebrid steps
     if not ctx.steps:
-        ctx.steps = [
+        steps = [
             PipelineStep(name="Haiku Research"),        # 0
             PipelineStep(name="Opus Design"),           # 1
             PipelineStep(name="Gemini Design Critique"),# 2
             PipelineStep(name="Qwen Hints"),            # 3
             PipelineStep(name="Sonnet Implement"),      # 4
-            PipelineStep(name="Sonnet Self-Review"),    # 5
-            PipelineStep(name="Gemini Cross-Review"),   # 6
-            PipelineStep(name="DeepSeek Audit"),        # 7
         ]
+        if ci_commands:
+            steps.append(PipelineStep(name="Local CI Check"))  # 5
+        steps += [
+            PipelineStep(name="Sonnet Self-Review"),    # 5 or 6
+            PipelineStep(name="Gemini Cross-Review"),   # 6 or 7
+            PipelineStep(name="DeepSeek Audit"),        # 7 or 8
+        ]
+        ctx.steps = steps
 
     try:
         # Fetch issue
         await progress_cb("Fetching issue...")
         await step_fetch_issue(ctx)
 
+        total_steps = len(ctx.steps)
+
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
         # ── Phase 0: Research ──
-        await progress_cb("[0/8] Haiku Research...")
+        await progress_cb(f"[0/{total_steps}] Haiku Research...")
         await step_haiku_research(ctx, settings, progress_cb, step_index=0)
 
         if cancel_event.is_set():
@@ -1203,7 +1385,7 @@ async def run_fivebrid_pipeline(
 
             # Step 1: Opus Design
             step_label = f" (iteration {iteration + 1})" if iteration > 0 else ""
-            await progress_cb(f"[1/8] Opus Design{step_label}...")
+            await progress_cb(f"[1/{total_steps}] Opus Design{step_label}...")
 
             if iteration > 0:
                 # Insert new design + critique step pairs after previous critique
@@ -1211,6 +1393,7 @@ async def run_fivebrid_pipeline(
                 insert_at = 3 + (iteration - 1) * 2
                 ctx.steps.insert(insert_at, PipelineStep(name=f"Opus Design (retry {iteration})"))
                 ctx.steps.insert(insert_at + 1, PipelineStep(name=f"Gemini Critique (retry {iteration})"))
+                total_steps = len(ctx.steps)
 
             design_idx = 1 + (iteration * 2)
             await step_opus_design(ctx, settings, progress_cb, step_index=design_idx)
@@ -1220,7 +1403,7 @@ async def run_fivebrid_pipeline(
 
             # Step 2: Gemini Design Critique (non-fatal)
             critique_idx = design_idx + 1
-            await progress_cb(f"[2/8] Gemini Design Critique{step_label}...")
+            await progress_cb(f"[2/{total_steps}] Gemini Design Critique{step_label}...")
             await step_gemini_design_critique(
                 ctx, gemini, settings, progress_cb, step_index=critique_idx,
             )
@@ -1242,13 +1425,13 @@ async def run_fivebrid_pipeline(
         # ── Phase B: Implementation ──
 
         # Find step indices dynamically (design loop may have added extra steps)
+        total_steps = len(ctx.steps)
         qwen_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Qwen Hints")
         impl_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Implement")
-        self_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Self-Review")
 
         # Step 3: Qwen Hints (non-fatal)
         try:
-            await progress_cb("[3/8] Qwen Pre-Implement...")
+            await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement...")
             await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=qwen_idx)
         except Exception as exc:
             logger.warning("Qwen pre-implement failed (non-fatal): %s", exc)
@@ -1257,7 +1440,7 @@ async def run_fivebrid_pipeline(
             return "skipped", "Cancelled by user"
 
         # Step 4: Sonnet Implement (uses existing step_claude_implement)
-        await progress_cb("[4/8] Sonnet Implement...")
+        await progress_cb(f"[4/{total_steps}] Sonnet Implement...")
         await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
 
         # Capture snapshot ref for safe-fail recovery
@@ -1273,8 +1456,20 @@ async def run_fivebrid_pipeline(
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 5: Sonnet Self-Review (safe-fail)
-        await progress_cb("[5/8] Sonnet Self-Review...")
+        # Step 5 (optional): Local CI Check
+        if ci_commands:
+            ci_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Local CI Check")
+            await progress_cb(f"[5/{total_steps}] Local CI Check...")
+            await step_local_ci_check(ctx, settings, progress_cb, ci_commands, step_index=ci_idx)
+
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
+
+        # Re-resolve dynamic indices after possible CI step
+        self_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Self-Review")
+
+        # Step 5/6: Sonnet Self-Review (safe-fail)
+        await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review...")
         await step_sonnet_self_review(ctx, settings, cancel_event, progress_cb, step_index=self_review_idx)
 
         if cancel_event.is_set():
@@ -1284,15 +1479,15 @@ async def run_fivebrid_pipeline(
         cross_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Gemini Cross-Review")
         audit_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "DeepSeek Audit")
 
-        # Step 6: Gemini Cross-Review (non-fatal)
-        await progress_cb("[6/8] Gemini Cross-Review...")
+        # Gemini Cross-Review (non-fatal)
+        await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review...")
         await step_gemini_cross_review(ctx, gemini, settings, progress_cb, step_index=cross_review_idx)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 7: DeepSeek Audit (fatal)
-        await progress_cb("[7/8] DeepSeek Audit...")
+        # DeepSeek Audit (fatal)
+        await progress_cb(f"[{audit_idx}/{total_steps}] DeepSeek Audit...")
         # Populate review_report for DeepSeek audit prompt (uses gemini cross-review as peer review)
         ctx.review_report = ctx.gemini_cross_review or ctx.self_review_report or "(no review available)"
         await step_deepseek_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
@@ -1301,7 +1496,7 @@ async def run_fivebrid_pipeline(
         if settings.enable_data_mining and ctx.audit_passed:
             ctx.steps.append(PipelineStep(name="Data Mining"))
             try:
-                await progress_cb("[8/8] Data Mining...")
+                await progress_cb(f"[{total_steps}/{total_steps}] Data Mining...")
                 await step_data_mining_fivebrid(ctx, ollama, settings, progress_cb, step_index=-1)
             except Exception as exc:
                 logger.warning("Data mining step failed (non-fatal): %s", exc)
@@ -1326,19 +1521,28 @@ async def run_dual_check_pipeline(
     settings: Settings,
     cancel_event: asyncio.Event,
     progress_cb: ProgressCallback,
+    project_info: dict | None = None,
 ) -> tuple[str, str]:
-    """Run the full 5-step pipeline with automatic retry on review failure. Returns (status, detail)."""
+    """Run the full 6-step pipeline with automatic retry on review failure. Returns (status, detail)."""
     max_retries = settings.max_review_retries
+
+    # Resolve CI commands once at start
+    ci_commands = _resolve_ci_commands(ctx.project_path, project_info) if settings.local_ci_enabled else []
 
     # Initialize steps if empty (default_factory is now list)
     if not ctx.steps:
-        ctx.steps = [
-            PipelineStep(name="DeepSeek Design"),
-            PipelineStep(name="Qwen Pre-Implement"),
-            PipelineStep(name="Claude Implement"),
-            PipelineStep(name="Claude Review"),
-            PipelineStep(name="DeepSeek Audit"),
+        steps = [
+            PipelineStep(name="DeepSeek Design"),      # 0
+            PipelineStep(name="Qwen Pre-Implement"),   # 1
+            PipelineStep(name="Claude Implement"),      # 2
         ]
+        if ci_commands:
+            steps.append(PipelineStep(name="Local CI Check"))  # 3
+        steps += [
+            PipelineStep(name="Claude Review"),         # 3 or 4
+            PipelineStep(name="DeepSeek Audit"),        # 4 or 5
+        ]
+        ctx.steps = steps
 
     try:
         # Fetch issue
@@ -1349,7 +1553,7 @@ async def run_dual_check_pipeline(
             return "skipped", "Cancelled by user"
 
         # Step 1: DeepSeek Design (once)
-        await progress_cb("[1/5] DeepSeek Design...")
+        await progress_cb("[1/6] DeepSeek Design...")
         await step_deepseek_design(ctx, ollama, settings, progress_cb)
 
         if cancel_event.is_set():
@@ -1357,7 +1561,7 @@ async def run_dual_check_pipeline(
 
         # Step 1.5: Qwen Pre-Implement (non-fatal)
         try:
-            await progress_cb("[1.5/5] Qwen Pre-Implement...")
+            await progress_cb("[1.5/6] Qwen Pre-Implement...")
             await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=1)
         except Exception as exc:
             logger.warning("Qwen pre-implement step failed (non-fatal): %s", exc)
@@ -1365,7 +1569,10 @@ async def run_dual_check_pipeline(
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Steps 2+3: Implement + Review (retry loop)
+        # Steps 2+3+4: Implement + CI Check + Review (retry loop)
+        ci_step_offset = 1 if ci_commands else 0  # extra step per attempt when CI enabled
+        steps_per_attempt = 2 + ci_step_offset  # impl + (ci) + review
+
         for attempt in range(max_retries + 1):
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
@@ -1374,23 +1581,36 @@ async def run_dual_check_pipeline(
             if attempt > 0:
                 ctx.retry_count = attempt
                 await _reset_worktree(ctx.project_path)
-                # Insert new step pair before the last step (DeepSeek Audit)
+                # Insert new steps before the last step (DeepSeek Audit)
                 ctx.steps.insert(-1, PipelineStep(name=f"Claude Implement (retry {attempt})"))
+                if ci_commands:
+                    ctx.steps.insert(-1, PipelineStep(name=f"Local CI Check (retry {attempt})"))
                 ctx.steps.insert(-1, PipelineStep(name=f"Claude Review (retry {attempt})"))
 
-            step_idx_impl = 2 + (attempt * 2)
-            step_idx_review = 3 + (attempt * 2)
+            step_idx_impl = 2 + (attempt * steps_per_attempt)
+            step_idx_ci = step_idx_impl + 1 if ci_commands else None
+            step_idx_review = step_idx_impl + ci_step_offset + 1
 
             # Step 2: Claude Implement
             attempt_label = f" (retry {attempt})" if attempt > 0 else ""
-            await progress_cb(f"[2/5] Claude Implement{attempt_label}...")
+            await progress_cb(f"[2/6] Claude Implement{attempt_label}...")
             await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=step_idx_impl)
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
 
-            # Step 3: Claude Review
-            await progress_cb(f"[3/5] Claude Review{attempt_label}...")
+            # Step 3: Local CI Check (if CI commands detected)
+            if ci_commands and step_idx_ci is not None:
+                await progress_cb(f"[3/6] Local CI Check{attempt_label}...")
+                await step_local_ci_check(
+                    ctx, settings, progress_cb, ci_commands, step_index=step_idx_ci,
+                )
+
+                if cancel_event.is_set():
+                    return "skipped", "Cancelled by user"
+
+            # Step 4: Claude Review
+            await progress_cb(f"[4/6] Claude Review{attempt_label}...")
             await step_claude_review(ctx, anthropic, settings, progress_cb=progress_cb, step_index=step_idx_review)
 
             if ctx.review_passed:
@@ -1408,15 +1628,15 @@ async def run_dual_check_pipeline(
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 4: DeepSeek Audit (always last non-mining step)
-        await progress_cb("[4/5] DeepSeek Audit...")
+        # Step 5: DeepSeek Audit (always last non-mining step)
+        await progress_cb("[5/6] DeepSeek Audit...")
         await step_deepseek_audit(ctx, ollama, settings, progress_cb, step_index=-1)
 
-        # Step 5: Data Mining (conditional, non-fatal)
+        # Step 6: Data Mining (conditional, non-fatal)
         if settings.enable_data_mining and ctx.audit_passed:
             ctx.steps.append(PipelineStep(name="Data Mining"))
             try:
-                await progress_cb("[5/5] Data Mining...")
+                await progress_cb("[6/6] Data Mining...")
                 await step_data_mining(ctx, ollama, settings, progress_cb, step_index=-1)
             except Exception as exc:
                 logger.warning("Data mining step failed (non-fatal): %s", exc)
@@ -2149,42 +2369,52 @@ async def step_plan_issues(
     claude_md: str,
     settings: Settings,
     progress_cb: ProgressCallback,
+    ollama: OllamaProvider,
 ) -> tuple[int, int, list[dict]]:
     """Plan next-stage issues for an existing project. Returns (created, total, issues_list)."""
 
-    prompt = (
-        f"You are a project manager planning the NEXT development stage.\n\n"
+    system_prompt = (
+        "You are a project manager planning the NEXT development stage. "
+        "Analyze the existing backlog keywords and imagine the Next Stage architecture "
+        "after those tasks are completed. Plan a roadmap-level set of issues that reflect "
+        "the project's evolution direction — NOT simple feature listings.\n\n"
+        "Output a JSON array (no markdown fences, no explanation, ONLY the JSON):\n"
+        '[{"title": "...", "body": "...", "labels": ["..."]}]\n\n'
+        "Rules:\n"
+        "- Each issue body should include clear acceptance criteria\n"
+        "- Each issue MUST include a 'Test Requirements' section specifying what tests "
+        "to write BEFORE implementation (TDD). Example: 'Write tests for X, Y, Z first, "
+        "then implement to make them pass.'\n"
+        "- Order issues by dependency (foundational first)\n"
+        "- Labels should be relevant (e.g., 'enhancement', 'feature', 'testing', 'refactor')\n"
+        "- Do NOT duplicate existing issues\n"
+        "- Be specific about file paths and implementation details"
+    )
+
+    user_content = (
         f"Project: {project_name}\n\n"
         f"--- CLAUDE.md ---\n{claude_md}\n---\n\n"
         f"--- Existing Issues (open + closed) ---\n{existing_issues_text}\n---\n\n"
-        f"Analyze the existing backlog keywords and imagine the Next Stage architecture "
-        f"after those tasks are completed. Plan a roadmap-level set of issues that reflect "
-        f"the project's evolution direction — NOT simple feature listings.\n\n"
-        f"Create 5-10 GitHub issues for the next development phase.\n\n"
-        f"Output a JSON array (no markdown fences, no explanation, ONLY the JSON):\n"
-        f'[{{"title": "...", "body": "...", "labels": ["..."]}}]\n\n'
-        f"Rules:\n"
-        f"- Each issue body should include clear acceptance criteria\n"
-        f"- Each issue MUST include a 'Test Requirements' section specifying what tests "
-        f"to write BEFORE implementation (TDD). Example: 'Write tests for X, Y, Z first, "
-        f"then implement to make them pass.'\n"
-        f"- Order issues by dependency (foundational first)\n"
-        f"- Labels should be relevant (e.g., 'enhancement', 'feature', 'testing', 'refactor')\n"
-        f"- Do NOT duplicate existing issues\n"
-        f"- Be specific about file paths and implementation details"
+        f"Create 5-10 GitHub issues for the next development phase."
     )
 
-    output = await _call_claude_cli_with_progress(
-        prompt,
-        model=settings.opus_model,
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    response = await _call_ollama_with_progress(
+        ollama, messages,
+        max_tokens=16384,
+        temperature=0.4,
+        system_prompt=system_prompt,
         timeout=settings.plan_timeout,
         progress_cb=progress_cb,
         step_name="Issue Planning",
+        model=settings.qwen_model,
+        num_ctx=32768,
     )
 
-    issues = _extract_json_array(output)
+    issues = _extract_json_array(response.content)
     if not issues:
-        raise RuntimeError(f"Could not extract JSON array from Opus output ({len(output)} chars)")
+        raise RuntimeError(f"Could not extract JSON array from Qwen output ({len(response.content)} chars)")
 
     return await _ensure_labels_and_create_issues(issues, github_user, project_name)
 
@@ -2197,33 +2427,43 @@ async def step_discuss_consult(
     question: str,
     settings: Settings,
     progress_cb: ProgressCallback,
+    ollama: OllamaProvider,
 ) -> str:
-    """Opus tech-lead consultation. Returns response text."""
+    """Qwen tech-lead consultation. Returns response text."""
 
-    prompt = (
-        f"You are a senior tech lead providing technical consulting for this project.\n\n"
+    system_prompt = (
+        "You are a senior tech lead providing technical consulting for this project. "
+        "Provide a direct, opinionated answer with:\n"
+        "- Concrete recommendations\n"
+        "- Code examples where helpful\n"
+        "- Trade-offs analysis\n"
+        "- Clear next steps\n\n"
+        "Be decisive and specific. Do not hedge unnecessarily."
+    )
+
+    user_content = (
         f"Project: {project_name}\n\n"
         f"--- CLAUDE.md ---\n{claude_md}\n---\n\n"
         f"--- Project File Tree ---\n{file_tree}\n---\n\n"
         f"--- Build Context (libraries, versions) ---\n{build_context}\n---\n\n"
-        f"Question: {question}\n\n"
-        f"Provide a direct, opinionated answer with:\n"
-        f"- Concrete recommendations\n"
-        f"- Code examples where helpful\n"
-        f"- Trade-offs analysis\n"
-        f"- Clear next steps\n\n"
-        f"Be decisive and specific. Do not hedge unnecessarily."
+        f"Question: {question}"
     )
 
-    output = await _call_claude_cli_with_progress(
-        prompt,
-        model=settings.opus_model,
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    response = await _call_ollama_with_progress(
+        ollama, messages,
+        max_tokens=16384,
+        temperature=0.7,
+        system_prompt=system_prompt,
         timeout=settings.discuss_timeout,
         progress_cb=progress_cb,
         step_name="Tech Consultation",
+        model=settings.qwen_model,
+        num_ctx=32768,
     )
 
-    return output
+    return response.content
 
 
 async def step_discuss_to_issues(
@@ -2234,35 +2474,45 @@ async def step_discuss_to_issues(
     discussion_text: str,
     settings: Settings,
     progress_cb: ProgressCallback,
+    ollama: OllamaProvider,
 ) -> tuple[int, int, list[dict]]:
     """Convert discussion into 1-3 GitHub issues. Returns (created, total, issues_list)."""
 
-    prompt = (
-        f"Based on the following technical discussion, extract the key action items "
-        f"and create 1-3 focused GitHub issues.\n\n"
-        f"--- Original Question ---\n{question}\n---\n\n"
-        f"--- Discussion ---\n{discussion_text}\n---\n\n"
-        f"Output a JSON array (no markdown fences, no explanation, ONLY the JSON):\n"
-        f'[{{"title": "...", "body": "...", "labels": ["..."]}}]\n\n'
-        f"Rules:\n"
-        f"- Each issue should be a concrete, actionable task\n"
-        f"- Each issue body should include acceptance criteria\n"
-        f"- Each issue MUST include a 'Test Requirements' section (TDD)\n"
-        f"- Labels should be relevant\n"
-        f"- 1-3 issues maximum — focus on the most impactful action items"
+    system_prompt = (
+        "Based on the following technical discussion, extract the key action items "
+        "and create 1-3 focused GitHub issues.\n\n"
+        "Output a JSON array (no markdown fences, no explanation, ONLY the JSON):\n"
+        '[{"title": "...", "body": "...", "labels": ["..."]}]\n\n'
+        "Rules:\n"
+        "- Each issue should be a concrete, actionable task\n"
+        "- Each issue body should include acceptance criteria\n"
+        "- Each issue MUST include a 'Test Requirements' section (TDD)\n"
+        "- Labels should be relevant\n"
+        "- 1-3 issues maximum — focus on the most impactful action items"
     )
 
-    output = await _call_claude_cli_with_progress(
-        prompt,
-        model=settings.opus_model,
+    user_content = (
+        f"--- Original Question ---\n{question}\n---\n\n"
+        f"--- Discussion ---\n{discussion_text}\n---"
+    )
+
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    response = await _call_ollama_with_progress(
+        ollama, messages,
+        max_tokens=8192,
+        temperature=0.4,
+        system_prompt=system_prompt,
         timeout=settings.discuss_issue_timeout,
         progress_cb=progress_cb,
         step_name="Discussion → Issues",
+        model=settings.qwen_model,
+        num_ctx=16384,
     )
 
-    issues = _extract_json_array(output)
+    issues = _extract_json_array(response.content)
     if not issues:
-        raise RuntimeError(f"Could not extract JSON array from Opus output ({len(output)} chars)")
+        raise RuntimeError(f"Could not extract JSON array from Qwen output ({len(response.content)} chars)")
 
     return await _ensure_labels_and_create_issues(issues, github_user, project_name)
 

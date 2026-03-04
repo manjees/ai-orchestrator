@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # Optional
     anthropic_api_key: str = ""
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "deepseek-r1:latest"
+    reasoning_model: str = "deepseek-r1:32b"     # CoT reasoning (Critique, Audit)
     anthropic_model: str = "claude-sonnet-4-5-20250929"
     tmux_session_name: str = "ai_factory"
     log_level: str = "INFO"
@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     deepseek_audit_max_tokens: int = 4096
     max_review_retries: int = 2
 
-    # Triple-Model Hybrid (Qwen Coder)
-    qwen_coder_model: str = "qwen2.5-coder:32b"
+    # Triple-Model Hybrid (Qwen)
+    qwen_model: str = "qwen3.5:35b"           # Action (Hints, Data Mining, /plan, /discuss)
     enable_data_mining: bool = True
     qwen_impl_timeout: int = 600          # Step 2: Qwen pre-impl (10 min)
     data_mining_timeout: int = 300         # Step 5: training data gen (5 min)
@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     plan_timeout: int = 900               # Opus 이슈 기획 (15분)
     discuss_timeout: int = 600            # Opus 기술 상담 (10분)
     discuss_issue_timeout: int = 300      # 논의 → 이슈 변환 (5분)
+
+    # Local CI Check (between implement and review)
+    local_ci_enabled: bool = True
+    local_ci_fix_retries: int = 2         # Sonnet 자동 수정 최대 횟수
+    local_ci_timeout: int = 180           # CI 커맨드 실행 타임아웃 (3분)
+    local_ci_fix_timeout: int = 300       # Sonnet 수정 세션 타임아웃 (5분)
+    local_ci_fatal: bool = False          # True: CI 실패 시 파이프라인 중단, False: 경고 후 계속
 
 
 def save_projects(projects: dict[str, dict]) -> None:
