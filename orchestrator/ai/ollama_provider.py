@@ -36,6 +36,7 @@ class OllamaProvider(AIProvider):
         system_prompt: str | None = None,
         timeout: int | None = None,
         model: str | None = None,
+        num_ctx: int | None = None,
     ) -> AIResponse:
         effective_model = model or self._model
 
@@ -52,6 +53,7 @@ class OllamaProvider(AIProvider):
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature,
+                **({"num_ctx": num_ctx} if num_ctx else {}),
             },
         }
         effective_timeout = timeout if timeout is not None else 300

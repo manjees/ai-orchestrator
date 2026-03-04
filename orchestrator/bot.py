@@ -54,9 +54,32 @@ async def _post_init(app: Application) -> None:
     # Ollama provider (always created — availability checked at runtime)
     ollama = OllamaProvider(
         base_url=settings.ollama_base_url,
-        model=settings.ollama_model,
+        model=settings.reasoning_model,
     )
     app.bot_data["ollama"] = ollama
+
+    # Verify Ollama models exist
+    missing_models: list[str] = []
+    for model_name in (settings.reasoning_model, settings.qwen_model):
+        try:
+            resp = await ollama._client.post("/api/show", json={"name": model_name})
+            if resp.status_code == 200:
+                logger.info("Ollama model verified: %s", model_name)
+            else:
+                missing_models.append(model_name)
+                logger.warning("Ollama model NOT found: %s", model_name)
+        except Exception:
+            logger.warning("Could not verify Ollama model: %s", model_name)
+
+    if missing_models:
+        pull_cmds = "\n".join(f"  ollama pull {m}" for m in missing_models)
+        try:
+            await app.bot.send_message(
+                settings.telegram_allowed_user_id,
+                f"⚠️ Missing Ollama models:\n{pull_cmds}",
+            )
+        except Exception:
+            pass  # Bot init phase — send may fail
 
     # Anthropic provider (only if API key is configured)
     if settings.anthropic_api_key:
