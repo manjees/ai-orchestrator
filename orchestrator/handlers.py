@@ -944,7 +944,7 @@ async def _solve_with_dual_check(
         if status == "success":
             # Create PR — push from worktree
             await _edit_msg(msg, f"<b>#{issue_num}</b> — Creating PR...")
-            pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title)
+            pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
 
             summary = format_pipeline_summary(ctx)
             if pr_url:
@@ -1077,7 +1077,7 @@ async def _solve_with_fivebrid(
 
         if status == "success":
             await _edit_msg(msg, f"<b>#{issue_num}</b> — Creating PR...")
-            pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title)
+            pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
 
             summary = format_pipeline_summary(ctx)
             if pr_url:
@@ -1335,7 +1335,50 @@ async def _cleanup_worktree(project_path: str, worktree_dir: str, branch_name: s
         logger.warning("Failed to remove worktree %s", worktree_dir)
 
 
-async def _create_pr(project_path: str, issue_num: int, branch_name: str, issue_title: str = "") -> tuple[str, str]:
+def _build_pr_body(issue_num: int, ctx: PipelineContext | None = None) -> str:
+    """Build a rich PR body from pipeline context."""
+    sections: list[str] = []
+
+    sections.append(f"Closes #{issue_num}")
+
+    if ctx and ctx.design_doc:
+        # Trim design doc to first ~1500 chars
+        design_summary = ctx.design_doc[:1500]
+        if len(ctx.design_doc) > 1500:
+            design_summary += "\n\n_(truncated)_"
+        sections.append(f"## Design\n{design_summary}")
+
+    if ctx and ctx.git_diff:
+        # Count changed files from diff
+        diff_files = [
+            line.split(" b/")[-1]
+            for line in ctx.git_diff.split("\n")
+            if line.startswith("diff --git")
+        ]
+        if diff_files:
+            file_list = "\n".join(f"- `{f}`" for f in diff_files[:20])
+            sections.append(f"## Changed Files ({len(diff_files)})\n{file_list}")
+
+    if ctx and ctx.review_report:
+        review_summary = ctx.review_report[:800]
+        if len(ctx.review_report) > 800:
+            review_summary += "\n\n_(truncated)_"
+        sections.append(f"## Review\n{review_summary}")
+
+    if ctx and ctx.audit_result:
+        verdict = "PASS" if ctx.audit_passed else "FAIL"
+        sections.append(f"## Audit: {verdict}")
+
+    return "\n\n".join(sections)
+
+
+async def _create_pr(
+    project_path: str,
+    issue_num: int,
+    branch_name: str,
+    issue_title: str = "",
+    ctx: PipelineContext | None = None,
+) -> tuple[str, str]:
     """Squash commits, push branch, and create PR. Returns (pr_url, error_msg)."""
     # Build PR title from issue title
     if issue_title:
@@ -1376,10 +1419,11 @@ async def _create_pr(project_path: str, issue_num: int, branch_name: str, issue_
         return "", stdout.decode(errors="replace") if stdout else "push failed"
 
     # Create PR
+    pr_body = _build_pr_body(issue_num, ctx)
     proc = await asyncio.create_subprocess_exec(
         "gh", "pr", "create",
         "--title", pr_title,
-        "--body", f"Closes #{issue_num}",
+        "--body", pr_body,
         cwd=project_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
