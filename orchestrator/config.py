@@ -97,7 +97,14 @@ class Settings(BaseSettings):
     local_ci_fix_retries: int = 2         # Sonnet 자동 수정 최대 횟수
     local_ci_timeout: int = 180           # CI 커맨드 실행 타임아웃 (3분)
     local_ci_fix_timeout: int = 300       # Sonnet 수정 세션 타임아웃 (5분)
-    local_ci_fatal: bool = False          # True: CI 실패 시 파이프라인 중단, False: 경고 후 계속
+    local_ci_fatal: bool = True           # True: CI 실패 시 파이프라인 중단 (No-Red-PR)
+
+    # AI Auditor (Intent-Based Cross-Model Audit)
+    ai_audit_enabled: bool = True
+    ai_audit_timeout: int = 600           # 10분
+    ai_audit_max_tokens: int = 8192
+    ai_audit_num_ctx: int = 32768
+    ai_audit_max_retries: int = 1         # Critical 발견 시 재구현 최대 횟수
 
 
 def save_projects(projects: dict[str, dict]) -> None:

@@ -21,6 +21,7 @@ from .ai.ollama_provider import OllamaProvider
 from .pipeline import (
     InitContext,
     PipelineContext,
+    format_intent_summary,
     format_pipeline_summary,
     run_dual_check_pipeline,
     run_fivebrid_pipeline,
@@ -952,12 +953,14 @@ async def _solve_with_dual_check(
             await _edit_msg(msg, f"<b>#{issue_num}</b> — Creating PR...")
             pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
 
-            summary = format_pipeline_summary(ctx)
+            intent_summary = format_intent_summary(ctx)
+            step_summary = format_pipeline_summary(ctx)
             if pr_url:
                 await _edit_msg(
                     msg,
                     f"<b>#{issue_num}</b> \u2705 Solved in {total_time}\nPR: {pr_url}\n\n"
-                    f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
+                    f"{html.escape(intent_summary)}\n\n"
+                    f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
                 )
                 return "success", f"PR created: {pr_url}"
             else:
@@ -965,16 +968,19 @@ async def _solve_with_dual_check(
                     msg,
                     f"<b>#{issue_num}</b> — Pipeline passed but PR failed:\n"
                     f"<pre>{_sanitize_output(pr_err)}</pre>\n\n"
-                    f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
+                    f"{html.escape(intent_summary)}\n\n"
+                    f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
                 )
                 return "failed", f"PR creation failed: {pr_err[:100]}"
         else:
-            summary = format_pipeline_summary(ctx)
+            intent_summary = format_intent_summary(ctx)
+            step_summary = format_pipeline_summary(ctx)
             await _edit_msg(
                 msg,
                 f"<b>#{issue_num}</b> \u274c {html.escape(status)}: {html.escape(detail[:200])}\n"
                 f"[{total_time}]\n\n"
-                f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
+                f"{html.escape(intent_summary)}\n\n"
+                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
             )
             return status, detail
 
@@ -1087,12 +1093,14 @@ async def _solve_with_fivebrid(
             await _edit_msg(msg, f"<b>#{issue_num}</b> — Creating PR...")
             pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
 
-            summary = format_pipeline_summary(ctx)
+            intent_summary = format_intent_summary(ctx)
+            step_summary = format_pipeline_summary(ctx)
             if pr_url:
                 await _edit_msg(
                     msg,
                     f"<b>#{issue_num}</b> \u2705 Solved in {total_time}\nPR: {pr_url}\n\n"
-                    f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
+                    f"{html.escape(intent_summary)}\n\n"
+                    f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
                 )
                 return "success", f"PR created: {pr_url}"
             else:
@@ -1100,16 +1108,19 @@ async def _solve_with_fivebrid(
                     msg,
                     f"<b>#{issue_num}</b> — Pipeline passed but PR failed:\n"
                     f"<pre>{_sanitize_output(pr_err)}</pre>\n\n"
-                    f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
+                    f"{html.escape(intent_summary)}\n\n"
+                    f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
                 )
                 return "failed", f"PR creation failed: {pr_err[:100]}"
         else:
-            summary = format_pipeline_summary(ctx)
+            intent_summary = format_intent_summary(ctx)
+            step_summary = format_pipeline_summary(ctx)
             await _edit_msg(
                 msg,
                 f"<b>#{issue_num}</b> \u274c {html.escape(status)}: {html.escape(detail[:200])}\n"
                 f"[{total_time}]\n\n"
-                f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
+                f"{html.escape(intent_summary)}\n\n"
+                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
             )
             return status, detail
 
@@ -1373,7 +1384,13 @@ def _build_pr_body(issue_num: int, ctx: PipelineContext | None = None) -> str:
             review_summary += "\n\n_(truncated)_"
         sections.append(f"## Review\n{review_summary}")
 
-    if ctx and ctx.audit_result:
+    if ctx and ctx.ai_audit_result:
+        verdict = "PASS" if ctx.ai_audit_passed else "FAIL"
+        audit_summary = ctx.ai_audit_result[:1000]
+        if len(ctx.ai_audit_result) > 1000:
+            audit_summary += "\n\n_(truncated)_"
+        sections.append(f"## AI Audit: {verdict}\n{audit_summary}")
+    elif ctx and ctx.audit_result:
         verdict = "PASS" if ctx.audit_passed else "FAIL"
         sections.append(f"## Audit: {verdict}")
 

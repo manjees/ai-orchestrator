@@ -65,6 +65,10 @@ class PipelineContext:
     gemini_cross_review: str = ""
     impl_snapshot_ref: str = ""
     ci_check_log: str = ""
+    ai_audit_result: str = ""
+    ai_audit_passed: bool = False
+    ci_fix_history: list[str] = field(default_factory=list)
+    audit_fix_history: list[str] = field(default_factory=list)
     steps: list[PipelineStep] = field(default_factory=list)
 
 
@@ -93,6 +97,14 @@ def parse_design_verdict(text: str) -> bool | None:
     ))
     if matches:
         return matches[-1].group(1).upper() == "APPROVED"
+    return None
+
+
+def parse_audit(text: str) -> bool | None:
+    """Extract [AUDIT: PASS] or [AUDIT: FAIL] from response (last match wins)."""
+    matches = list(re.finditer(r"\[AUDIT:\s*(PASS|FAIL)\]", text, re.IGNORECASE))
+    if matches:
+        return matches[-1].group(1).upper() == "PASS"
     return None
 
 
@@ -194,6 +206,29 @@ async def _run_local_ci(
     return True, full_log
 
 
+def _extract_test_failures(log: str, max_chars: int = 500) -> str:
+    """Extract failed test names/errors from CI log for concise reporting."""
+    patterns = [
+        re.compile(r"^.*FAILED.*$", re.MULTILINE),           # pytest / Gradle
+        re.compile(r"^.*FAIL:.*$", re.MULTILINE),            # Go
+        re.compile(r"^.*failing.*$", re.MULTILINE | re.IGNORECASE),  # npm/jest
+        re.compile(r"^.*Error:.*$", re.MULTILINE),           # Generic errors
+        re.compile(r"^E\s+.*$", re.MULTILINE),               # pytest assertion details
+    ]
+    failures: list[str] = []
+    seen: set[str] = set()
+    for pat in patterns:
+        for m in pat.finditer(log):
+            line = m.group(0).strip()
+            if line not in seen:
+                seen.add(line)
+                failures.append(line)
+    result = "\n".join(failures)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n...(truncated)"
+    return result or "(no specific failures extracted)"
+
+
 async def step_local_ci_check(
     ctx: PipelineContext,
     settings: Settings,
@@ -250,13 +285,16 @@ async def step_local_ci_check(
                     ctx.git_diff = await _capture_filtered_diff(
                         ctx.project_path, base_ref=ctx.base_commit or "main",
                     )
+                    fail_count = len(_extract_test_failures(log).split("\n"))
+                    ctx.ci_fix_history.append(f"attempt {attempt + 1}: {fail_count} failures → auto-fixed")
                 except Exception as fix_exc:
                     logger.warning("CI auto-fix attempt %d failed: %s", attempt + 1, fix_exc)
             else:
                 # No retries left
                 if settings.local_ci_fatal:
+                    fail_summary = _extract_test_failures(log)
                     step.status = "failed"
-                    step.detail = f"CI failed after {max_retries + 1} attempts"
+                    step.detail = f"CI failed after {max_retries + 1} attempts\n{fail_summary}"
                     raise RuntimeError(step.detail)
                 else:
                     step.status = "skipped"
@@ -838,6 +876,111 @@ async def step_deepseek_audit(
         step.elapsed_sec = time.monotonic() - start
 
 
+async def step_ai_audit(
+    ctx: PipelineContext,
+    ollama: OllamaProvider,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = -1,
+) -> None:
+    """Intent-based adversarial AI audit using DeepSeek reasoning model."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    # Read project CLAUDE.md if available
+    claude_md_path = Path(ctx.project_path) / ".claude" / "CLAUDE.md"
+    claude_md_content = ""
+    if claude_md_path.exists():
+        try:
+            claude_md_content = claude_md_path.read_text(errors="replace")[:3000]
+        except Exception:
+            claude_md_content = "(could not read CLAUDE.md)"
+
+    system_prompt = (
+        "You are an adversarial code auditor. Your job is to FIND FLAWS, "
+        "not to praise. Assume the implementer made mistakes. "
+        "Think like an attacker exploiting this code in production."
+    )
+
+    user_content = (
+        f"## Original Intent\n"
+        f"Issue #{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body}\n\n"
+        f"## Design Document\n{ctx.design_doc}\n\n"
+        f"## Implementation Diff\n{ctx.git_diff}\n\n"
+    )
+    if claude_md_content:
+        user_content += f"## CLAUDE.md Guidelines\n{claude_md_content}\n\n"
+    if ctx.review_report:
+        user_content += f"## Previous Reviews\n{ctx.review_report}\n\n"
+
+    user_content += (
+        "Audit this implementation against the ORIGINAL INTENT:\n"
+        "1. INTENT ALIGNMENT: Does the code fully satisfy the issue requirements? Any missing functionality?\n"
+        "2. LOGIC FLAWS: Edge cases, race conditions, off-by-one errors the implementer likely missed.\n"
+        "3. SECURITY: Injection, XSS, auth bypass, data exposure vulnerabilities.\n"
+        "4. GUIDELINE VIOLATIONS: Does the code violate CLAUDE.md conventions?\n"
+        "   - COMMENT POLICY: If the code contains 'what' comments instead of 'why' comments, mark as [MAJOR].\n"
+        "     Only 'why' comments are allowed. Self-documenting naming is mandatory.\n\n"
+        "For each finding, classify as [CRITICAL], [MAJOR], or [MINOR].\n\n"
+        "End with exactly one of:\n"
+        "[AUDIT: PASS] — no critical or major issues\n"
+        "[AUDIT: FAIL] — critical issues found that must be fixed"
+    )
+
+    messages = [Message(role=Role.USER, content=user_content)]
+
+    try:
+        response = await _call_ollama_with_progress(
+            ollama, messages,
+            max_tokens=settings.ai_audit_max_tokens,
+            temperature=0.3,
+            system_prompt=system_prompt,
+            timeout=settings.ai_audit_timeout,
+            progress_cb=progress_cb,
+            step_name="AI Audit",
+            model=settings.reasoning_model,
+            num_ctx=settings.ai_audit_num_ctx,
+        )
+        ctx.ai_audit_result = response.content
+        verdict = parse_audit(response.content)
+
+        if verdict is None:
+            # Fallback: try legacy [FINAL: APPROVED/REJECTED] format
+            legacy = parse_final(response.content)
+            if legacy is not None:
+                verdict = legacy
+
+        if verdict is True:
+            ctx.ai_audit_passed = True
+            # Also set legacy fields for backward compat
+            ctx.audit_result = response.content
+            ctx.audit_passed = True
+            step.status = "passed"
+            step.detail = "AUDIT: PASS"
+        elif verdict is False:
+            ctx.audit_result = response.content
+            ctx.audit_passed = False
+            step.status = "failed"
+            step.detail = "AUDIT: FAIL"
+            raise RuntimeError("AI Audit returned FAIL — critical issues found")
+        else:
+            ctx.audit_result = response.content
+            ctx.audit_passed = False
+            step.status = "failed"
+            step.detail = "No audit tag found — treated as FAIL"
+            raise RuntimeError("AI Audit did not include [AUDIT: PASS/FAIL]")
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = str(exc)[:200]
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
 # ── Data Mining ──────────────────────────────────────────────────────────────
 
 async def step_data_mining(
@@ -1355,7 +1498,7 @@ async def run_fivebrid_pipeline(
         steps += [
             PipelineStep(name="Sonnet Self-Review"),    # 5 or 6
             PipelineStep(name="Gemini Cross-Review"),   # 6 or 7
-            PipelineStep(name="DeepSeek Audit"),        # 7 or 8
+            PipelineStep(name="AI Audit"),               # 7 or 8
         ]
         ctx.steps = steps
 
@@ -1477,7 +1620,7 @@ async def run_fivebrid_pipeline(
 
         # ── Phase C: Audit ──
         cross_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Gemini Cross-Review")
-        audit_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "DeepSeek Audit")
+        audit_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "AI Audit")
 
         # Gemini Cross-Review (non-fatal)
         await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review...")
@@ -1486,14 +1629,50 @@ async def run_fivebrid_pipeline(
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # DeepSeek Audit (fatal)
-        await progress_cb(f"[{audit_idx}/{total_steps}] DeepSeek Audit...")
-        # Populate review_report for DeepSeek audit prompt (uses gemini cross-review as peer review)
+        # AI Audit with retry loop
         ctx.review_report = ctx.gemini_cross_review or ctx.self_review_report or "(no review available)"
-        await step_deepseek_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
+
+        for audit_attempt in range(settings.ai_audit_max_retries + 1):
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
+
+            audit_label = f" (retry {audit_attempt})" if audit_attempt > 0 else ""
+            await progress_cb(f"[{audit_idx}/{total_steps}] AI Audit{audit_label}...")
+
+            try:
+                await step_ai_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
+                break  # PASS
+            except RuntimeError:
+                if audit_attempt < settings.ai_audit_max_retries:
+                    # Audit failed — feed back to Sonnet for re-implementation
+                    ctx.audit_fix_history.append(
+                        f"audit retry {audit_attempt + 1}: {ctx.ai_audit_result[:200]}"
+                    )
+                    ctx.review_feedback = ctx.ai_audit_result
+
+                    await progress_cb(f"AI Audit FAIL — Sonnet re-implementing (retry {audit_attempt + 1})...")
+                    # Reset to snapshot
+                    if ctx.impl_snapshot_ref:
+                        await _reset_to_snapshot(ctx.project_path, ctx.impl_snapshot_ref)
+
+                    # Re-implement
+                    await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
+                    await _snapshot_commit(ctx.project_path, ctx.issue_num)
+                    ctx.git_diff = await _capture_filtered_diff(
+                        ctx.project_path, base_ref=ctx.base_commit or "main",
+                    )
+
+                    # Re-run CI if applicable
+                    if ci_commands:
+                        await step_local_ci_check(ctx, settings, progress_cb, ci_commands, step_index=ci_idx)
+
+                    # Reset audit step for retry
+                    ctx.steps[audit_idx] = PipelineStep(name=f"AI Audit (retry {audit_attempt + 1})")
+                else:
+                    raise  # Final failure
 
         # ── Phase D: Post-Process ──
-        if settings.enable_data_mining and ctx.audit_passed:
+        if settings.enable_data_mining and ctx.ai_audit_passed:
             ctx.steps.append(PipelineStep(name="Data Mining"))
             try:
                 await progress_cb(f"[{total_steps}/{total_steps}] Data Mining...")
@@ -1540,7 +1719,7 @@ async def run_dual_check_pipeline(
             steps.append(PipelineStep(name="Local CI Check"))  # 3
         steps += [
             PipelineStep(name="Claude Review"),         # 3 or 4
-            PipelineStep(name="DeepSeek Audit"),        # 4 or 5
+            PipelineStep(name="AI Audit"),              # 4 or 5
         ]
         ctx.steps = steps
 
@@ -1628,12 +1807,47 @@ async def run_dual_check_pipeline(
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 5: DeepSeek Audit (always last non-mining step)
-        await progress_cb("[5/6] DeepSeek Audit...")
-        await step_deepseek_audit(ctx, ollama, settings, progress_cb, step_index=-1)
+        # Step 5: AI Audit with retry loop
+        audit_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "AI Audit")
+
+        for audit_attempt in range(settings.ai_audit_max_retries + 1):
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
+
+            audit_label = f" (retry {audit_attempt})" if audit_attempt > 0 else ""
+            await progress_cb(f"[5/6] AI Audit{audit_label}...")
+
+            try:
+                await step_ai_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
+                break  # PASS
+            except RuntimeError:
+                if audit_attempt < settings.ai_audit_max_retries:
+                    ctx.audit_fix_history.append(
+                        f"audit retry {audit_attempt + 1}: {ctx.ai_audit_result[:200]}"
+                    )
+                    ctx.review_feedback = ctx.ai_audit_result
+                    await progress_cb(f"AI Audit FAIL — Sonnet re-implementing (retry {audit_attempt + 1})...")
+                    await _reset_worktree(ctx.project_path)
+
+                    # Re-implement
+                    impl_retry_idx = len(ctx.steps)
+                    ctx.steps.insert(audit_idx, PipelineStep(name=f"Claude Implement (audit-fix {audit_attempt + 1})"))
+                    audit_idx += 1  # Shift audit index
+                    await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_retry_idx)
+
+                    # Re-run CI if applicable
+                    if ci_commands:
+                        ci_fix_idx = next((i for i, s in enumerate(ctx.steps) if "Local CI Check" in s.name), None)
+                        if ci_fix_idx is not None:
+                            await step_local_ci_check(ctx, settings, progress_cb, ci_commands, step_index=ci_fix_idx)
+
+                    # Reset audit step for retry
+                    ctx.steps[audit_idx] = PipelineStep(name=f"AI Audit (retry {audit_attempt + 1})")
+                else:
+                    raise  # Final failure
 
         # Step 6: Data Mining (conditional, non-fatal)
-        if settings.enable_data_mining and ctx.audit_passed:
+        if settings.enable_data_mining and ctx.ai_audit_passed:
             ctx.steps.append(PipelineStep(name="Data Mining"))
             try:
                 await progress_cb("[6/6] Data Mining...")
@@ -1758,12 +1972,61 @@ def format_pipeline_summary(ctx: PipelineContext) -> str:
             elapsed_str = f" ({mins}m {secs}s)" if mins else f" ({secs}s)"
 
         lines.append(f"  {icon} {s.name}{elapsed_str}")
+        if s.status == "failed" and s.detail:
+            detail_lines = s.detail[:500].split("\n")
+            for dl in detail_lines[:5]:
+                lines.append(f"      \u2514 {dl}")
 
     # Append review feedback when review failed
     review_step = next((s for s in ctx.steps if "Review" in s.name and s.status == "failed"), None)
     if review_step and ctx.review_report:
         summary = _extract_review_summary(ctx.review_report)
         lines.append(f"\n\U0001f4cb Review Feedback:\n{summary[:3000]}")
+
+    return "\n".join(lines)
+
+
+def format_intent_summary(ctx: PipelineContext) -> str:
+    """Format an intent-centric summary for Telegram reporting."""
+    lines: list[str] = []
+
+    # Intent result
+    any_failed = any(s.status == "failed" for s in ctx.steps)
+    intent_verdict = "\u274c FAIL" if any_failed else "\u2705 PASS"
+    lines.append(f"\U0001f3af Intent: {ctx.issue_title}")
+    lines.append(f"   \u2192 {intent_verdict}")
+
+    # Test-Gate
+    ci_step = next((s for s in ctx.steps if "CI Check" in s.name), None)
+    if ci_step:
+        ci_verdict = "\u2705 PASS" if ci_step.status == "passed" else "\u274c FAIL"
+        lines.append(f"\n\U0001f9ea Tests: {ci_verdict}")
+        if ctx.ci_fix_history:
+            history = " \u2192 ".join(ctx.ci_fix_history)
+            lines.append(f"   \u2192 {history} \u2192 final {ci_step.status}")
+        elif ci_step.status == "passed":
+            lines.append("   \u2192 All tests passed on first run")
+        elif ci_step.detail:
+            lines.append(f"   \u2192 {ci_step.detail[:200]}")
+
+    # AI Audit
+    audit_step = next((s for s in ctx.steps if "AI Audit" in s.name), None)
+    if audit_step:
+        audit_verdict = "\u2705 PASS" if audit_step.status == "passed" else "\u274c FAIL"
+        lines.append(f"\n\U0001f50d AI Audit: {audit_verdict}")
+        if ctx.ai_audit_result:
+            # Extract first few meaningful lines (skip thinking tokens)
+            audit_lines = [
+                l.strip() for l in ctx.ai_audit_result.split("\n")
+                if l.strip() and not l.strip().startswith("<")
+            ]
+            summary = "\n".join(audit_lines[:3])
+            if len(summary) > 300:
+                summary = summary[:300] + "..."
+            lines.append(f"   \u2192 {summary}")
+        if ctx.audit_fix_history:
+            for h in ctx.audit_fix_history:
+                lines.append(f"   \u2192 {h[:200]}")
 
     return "\n".join(lines)
 
