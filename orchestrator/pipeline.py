@@ -212,21 +212,29 @@ def _extract_test_failures(log: str, max_chars: int = 500) -> str:
         re.compile(r"^.*FAILED.*$", re.MULTILINE),           # pytest / Gradle
         re.compile(r"^.*FAIL:.*$", re.MULTILINE),            # Go
         re.compile(r"^.*failing.*$", re.MULTILINE | re.IGNORECASE),  # npm/jest
-        re.compile(r"^.*Error:.*$", re.MULTILINE),           # Generic errors
+        re.compile(r"^.*[Ee]rror[:\s].*$", re.MULTILINE),    # Generic errors
         re.compile(r"^E\s+.*$", re.MULTILINE),               # pytest assertion details
+        re.compile(r"^.*couldn't be completed.*$", re.MULTILINE | re.IGNORECASE),  # macOS system
+        re.compile(r"^.*not found.*$", re.MULTILINE | re.IGNORECASE),  # command not found
+        re.compile(r"^.*Unable to .*$", re.MULTILINE),       # Unable to locate...
+        re.compile(r"^.*exception.*$", re.MULTILINE | re.IGNORECASE),  # exceptions
     ]
     failures: list[str] = []
     seen: set[str] = set()
     for pat in patterns:
         for m in pat.finditer(log):
             line = m.group(0).strip()
-            if line not in seen:
+            if line and line not in seen:
                 seen.add(line)
                 failures.append(line)
+    if not failures:
+        # Fallback: show last non-empty lines of log
+        tail_lines = [l.strip() for l in log.strip().split("\n") if l.strip()]
+        failures = tail_lines[-5:] if tail_lines else ["(empty CI log)"]
     result = "\n".join(failures)
     if len(result) > max_chars:
         result = result[:max_chars] + "\n...(truncated)"
-    return result or "(no specific failures extracted)"
+    return result
 
 
 async def step_local_ci_check(
