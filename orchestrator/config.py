@@ -101,7 +101,7 @@ class Settings(BaseSettings):
 
     # AI Auditor (Intent-Based Cross-Model Audit)
     ai_audit_enabled: bool = True
-    ai_audit_timeout: int = 600           # 10분
+    ai_audit_timeout: int = 1200          # 20분 (R1 reasoning + 32K context)
     ai_audit_max_tokens: int = 8192
     ai_audit_num_ctx: int = 32768
     ai_audit_max_retries: int = 3         # Critical 발견 시 재구현 최대 횟수 (solve_timeout이 안전장치)

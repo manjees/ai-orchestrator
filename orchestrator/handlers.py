@@ -7,6 +7,7 @@ import html
 import logging
 import os
 import re
+import shutil
 import signal
 import time
 
@@ -18,6 +19,16 @@ from telegram.ext import ContextTypes
 from .ai.anthropic_provider import AnthropicProvider
 from .ai.gemini_provider import GeminiCLIProvider
 from .ai.ollama_provider import OllamaProvider
+from .checkpoint import (
+    check_staleness,
+    create_checkpoint_tag,
+    delete_checkpoint,
+    delete_checkpoint_tag,
+    list_checkpoints,
+    load_checkpoint,
+    restore_context,
+    save_checkpoint,
+)
 from .pipeline import (
     InitContext,
     PipelineContext,
@@ -57,6 +68,34 @@ _discuss_results: dict[int, dict] = {}
 
 # ANSI escape codes: CSI sequences (incl. ?/= private modes), OSC sequences, single ESC codes
 _ANSI_RE = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^[\]()]")
+
+
+async def _save_checkpoint_on_failure(
+    ctx: PipelineContext,
+    worktree_dir: str,
+    project_name: str,
+    issue_num: int,
+    pipeline_mode: str,
+) -> None:
+    """Save checkpoint + git tag if the pipeline failed and has an impl snapshot."""
+    if not (ctx and ctx.impl_snapshot_ref):
+        return
+    # Single-pass: find first failed step and its index
+    failed_step = None
+    failed_idx = -1
+    for i, s in enumerate(ctx.steps):
+        if s.status == "failed":
+            failed_step = s
+            failed_idx = i
+            break
+    if failed_step is None:
+        return
+    await create_checkpoint_tag(worktree_dir, project_name, issue_num, ctx.impl_snapshot_ref)
+    save_checkpoint(
+        ctx, pipeline_mode=pipeline_mode,
+        failed_step_name=failed_step.name,
+        failed_step_index=failed_idx,
+    )
 
 
 def _resolve_project(name: str, projects: dict[str, dict]) -> tuple[str | None, str]:
@@ -956,6 +995,9 @@ async def _solve_with_dual_check(
             intent_summary = format_intent_summary(ctx)
             step_summary = format_pipeline_summary(ctx)
             if pr_url:
+                # Success — clean up checkpoint
+                delete_checkpoint(project_name, issue_num)
+                await delete_checkpoint_tag(project_path, project_name, issue_num)
                 await _edit_msg(
                     msg,
                     f"<b>#{issue_num}</b> \u2705 Solved in {total_time}\nPR: {pr_url}\n\n"
@@ -973,6 +1015,10 @@ async def _solve_with_dual_check(
                 )
                 return "failed", f"PR creation failed: {pr_err[:100]}"
         else:
+            # Failed — add retry hint if checkpoint is possible
+            retry_hint = ""
+            if ctx and ctx.impl_snapshot_ref:
+                retry_hint = f"\n\n💡 <code>/retry {html.escape(project_name)} {issue_num}</code>"
             intent_summary = format_intent_summary(ctx)
             step_summary = format_pipeline_summary(ctx)
             await _edit_msg(
@@ -980,7 +1026,8 @@ async def _solve_with_dual_check(
                 f"<b>#{issue_num}</b> \u274c {html.escape(status)}: {html.escape(detail[:200])}\n"
                 f"[{total_time}]\n\n"
                 f"{html.escape(intent_summary)}\n\n"
-                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
+                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}"
+                f"{retry_hint}",
             )
             return status, detail
 
@@ -990,6 +1037,7 @@ async def _solve_with_dual_check(
         return "failed", str(exc)[:100]
     finally:
         if worktree_dir:
+            await _save_checkpoint_on_failure(ctx, worktree_dir, project_name, issue_num, "dual_check")
             await _cleanup_worktree(project_path, worktree_dir, branch_name)
 
 
@@ -1096,6 +1144,9 @@ async def _solve_with_fivebrid(
             intent_summary = format_intent_summary(ctx)
             step_summary = format_pipeline_summary(ctx)
             if pr_url:
+                # Success — clean up checkpoint
+                delete_checkpoint(project_name, issue_num)
+                await delete_checkpoint_tag(project_path, project_name, issue_num)
                 await _edit_msg(
                     msg,
                     f"<b>#{issue_num}</b> \u2705 Solved in {total_time}\nPR: {pr_url}\n\n"
@@ -1113,6 +1164,10 @@ async def _solve_with_fivebrid(
                 )
                 return "failed", f"PR creation failed: {pr_err[:100]}"
         else:
+            # Failed — add retry hint if checkpoint is possible
+            retry_hint = ""
+            if ctx and ctx.impl_snapshot_ref:
+                retry_hint = f"\n\n💡 <code>/retry {html.escape(project_name)} {issue_num}</code>"
             intent_summary = format_intent_summary(ctx)
             step_summary = format_pipeline_summary(ctx)
             await _edit_msg(
@@ -1120,7 +1175,8 @@ async def _solve_with_fivebrid(
                 f"<b>#{issue_num}</b> \u274c {html.escape(status)}: {html.escape(detail[:200])}\n"
                 f"[{total_time}]\n\n"
                 f"{html.escape(intent_summary)}\n\n"
-                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
+                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}"
+                f"{retry_hint}",
             )
             return status, detail
 
@@ -1130,6 +1186,7 @@ async def _solve_with_fivebrid(
         return "failed", str(exc)[:100]
     finally:
         if worktree_dir:
+            await _save_checkpoint_on_failure(ctx, worktree_dir, project_name, issue_num, "fivebrid")
             await _cleanup_worktree(project_path, worktree_dir, branch_name)
 
 
@@ -1279,22 +1336,28 @@ async def _solve_direct_claude(
             await _cleanup_worktree(project_path, worktree_dir, branch_name)
 
 
-async def _git_fresh_start(project_path: str, branch_name: str) -> tuple[bool, str]:
+async def _git_fresh_start(
+    project_path: str,
+    branch_name: str,
+    *,
+    ref: str = "origin/main",
+    skip_fetch: bool = False,
+) -> tuple[bool, str]:
     """Create a git worktree for the branch. Returns (ok, error_or_worktree_path).
 
     On success, the second element is the worktree path.
     On failure, the second element is the error message.
-    """
-    import os
-    import shutil
 
+    Args:
+        ref: Git ref to base the worktree on (default: origin/main).
+        skip_fetch: If True, skip fetching origin/main (caller already did it).
+    """
     worktree_dir = os.path.join(project_path, ".worktrees", branch_name.replace("/", "-"))
 
     # 1. Force remove worktree directory if it exists
-    if os.path.exists(worktree_dir):
-        shutil.rmtree(worktree_dir, ignore_errors=True)
+    shutil.rmtree(worktree_dir, ignore_errors=True)
 
-    # 3. Prune stale worktree references
+    # 2. Prune stale worktree references
     proc = await asyncio.create_subprocess_exec(
         "git", "worktree", "prune",
         cwd=project_path,
@@ -1303,7 +1366,7 @@ async def _git_fresh_start(project_path: str, branch_name: str) -> tuple[bool, s
     )
     await asyncio.wait_for(proc.communicate(), timeout=10)
 
-    # 4. Force delete branch if it exists (from a previous run)
+    # 3. Force delete branch if it exists (from a previous run)
     proc = await asyncio.create_subprocess_exec(
         "git", "branch", "-D", branch_name,
         cwd=project_path,
@@ -1313,21 +1376,22 @@ async def _git_fresh_start(project_path: str, branch_name: str) -> tuple[bool, s
     await asyncio.wait_for(proc.communicate(), timeout=10)
     # Ignore errors — branch may not exist
 
-    # 5. Fetch latest main
-    proc = await asyncio.create_subprocess_exec(
-        "git", "fetch", "origin", "main",
-        cwd=project_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-    if proc.returncode != 0:
-        output = stdout.decode(errors="replace") if stdout else ""
-        return False, f"git fetch failed: {output}"
+    # 4. Fetch latest main
+    if not skip_fetch:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "fetch", "origin", "main",
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            output = stdout.decode(errors="replace") if stdout else ""
+            return False, f"git fetch failed: {output}"
 
-    # 5. Create worktree with new branch based on origin/main
+    # 5. Create worktree with new branch based on ref
     proc = await asyncio.create_subprocess_exec(
-        "git", "worktree", "add", "-B", branch_name, worktree_dir, "origin/main",
+        "git", "worktree", "add", "-B", branch_name, worktree_dir, ref,
         cwd=project_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -1546,9 +1610,7 @@ async def _rebase_pr(
 
     try:
         # ── Step A: Git preparation ──
-        import shutil
-        if os.path.exists(worktree_dir):
-            shutil.rmtree(worktree_dir, ignore_errors=True)
+        shutil.rmtree(worktree_dir, ignore_errors=True)
 
         # Prune stale worktrees
         proc = await asyncio.create_subprocess_exec(
@@ -2554,6 +2616,304 @@ async def discuss_create_issues_callback(update: Update, context: ContextTypes.D
             pass
 
 
+# ── /retry ───────────────────────────────────────────────────────────────────
+
+async def retry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resume a failed solve from checkpoint.
+
+    /retry              — list available checkpoints
+    /retry <project> <issue#> — resume from checkpoint
+    /retry clear <project> <issue#> — delete checkpoint
+    """
+    try:
+        args = context.args or []
+
+        # /retry — list checkpoints
+        if not args:
+            checkpoints = list_checkpoints()
+            if not checkpoints:
+                await _safe_reply(update, "No checkpoints available.")
+                return
+            lines = ["<b>Available Checkpoints</b>\n"]
+            for cp in checkpoints:
+                lines.append(
+                    f"  • <code>{html.escape(cp['project_name'])}</code> "
+                    f"#{cp['issue_num']} — failed at <b>{html.escape(cp['failed_step_name'])}</b> "
+                    f"({cp['pipeline_mode']})"
+                )
+            lines.append(f"\nUsage: <code>/retry &lt;project&gt; &lt;issue#&gt;</code>")
+            await _safe_reply(update, "\n".join(lines))
+            return
+
+        # /retry clear <project> <issue#>
+        if args[0] == "clear":
+            if len(args) < 3:
+                await _safe_reply(update, "Usage: <code>/retry clear &lt;project&gt; &lt;issue#&gt;</code>")
+                return
+            project_name, err = _resolve_project(args[1], context.bot_data.get("projects", {}))
+            if project_name is None:
+                await _safe_reply(update, err)
+                return
+            try:
+                issue_num = int(args[2])
+            except ValueError:
+                await _safe_reply(update, f"Invalid issue number: <code>{html.escape(args[2])}</code>")
+                return
+            projects: dict = context.bot_data.get("projects", {})
+            project_path = projects[project_name]["path"]
+            delete_checkpoint(project_name, issue_num)
+            await delete_checkpoint_tag(project_path, project_name, issue_num)
+            await _safe_reply(update, f"Checkpoint cleared: {html.escape(project_name)} #{issue_num}")
+            return
+
+        # /retry <project> <issue#>
+        if len(args) < 2:
+            await _safe_reply(update, "Usage: <code>/retry &lt;project&gt; &lt;issue#&gt;</code>")
+            return
+
+        project_name, err = _resolve_project(args[0], context.bot_data.get("projects", {}))
+        if project_name is None:
+            await _safe_reply(update, err)
+            return
+
+        try:
+            issue_num = int(args[1])
+        except ValueError:
+            await _safe_reply(update, f"Invalid issue number: <code>{html.escape(args[1])}</code>")
+            return
+
+        # Load checkpoint
+        checkpoint = load_checkpoint(project_name, issue_num)
+        if not checkpoint:
+            await _safe_reply(
+                update,
+                f"No checkpoint found for <code>{html.escape(project_name)}</code> #{issue_num}",
+            )
+            return
+
+        chat_id = update.effective_chat.id  # type: ignore[union-attr]
+
+        # Duplicate check
+        existing = _solve_cancels.get(chat_id, {})
+        if issue_num in existing:
+            await _safe_reply(update, f"Already running: #{issue_num}. Cancel first.")
+            return
+
+        # Register cancel event
+        cancel_event = asyncio.Event()
+        _solve_cancels.setdefault(chat_id, {})[issue_num] = cancel_event
+        _solve_active[chat_id] = _solve_active.get(chat_id, 0) + 1
+
+        projects = context.bot_data.get("projects", {})
+        project_path = projects[project_name]["path"]
+
+        asyncio.create_task(
+            _retry_from_checkpoint(
+                context, chat_id, project_name, project_path,
+                issue_num, cancel_event, checkpoint,
+            )
+        )
+
+        failed_step = checkpoint.get("failed_step_name", "unknown")
+        await _safe_reply(
+            update,
+            f"Resuming <b>{html.escape(project_name)}</b> #{issue_num} from <b>{html.escape(failed_step)}</b>...",
+        )
+
+    except Exception:
+        logger.exception("/retry handler error")
+        await _safe_reply(update, "Error starting retry.")
+
+
+async def _retry_from_checkpoint(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    project_name: str,
+    project_path: str,
+    issue_num: int,
+    cancel_event: asyncio.Event,
+    checkpoint: dict,
+) -> None:
+    """Restore worktree from checkpoint tag and resume the pipeline."""
+    settings = context.bot_data["settings"]
+    projects: dict = context.bot_data.get("projects", {})
+    project_info = projects.get(project_name, {})
+    pipeline_mode = checkpoint.get("pipeline_mode", "fivebrid")
+    failed_idx = checkpoint.get("failed_step_index", -1)
+    branch_name = checkpoint["ctx"].get("branch_name", f"solve/issue-{issue_num}")
+    tag_name = f"checkpoint/{project_name}/{issue_num}"
+
+    cancel_btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Cancel", callback_data=f"cancel_solve:{chat_id}:{issue_num}")]
+    ])
+    msg = await context.bot.send_message(
+        chat_id,
+        f"<b>#{issue_num}</b> 🔄 Resuming from checkpoint...",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_btn,
+    )
+
+    pipeline_start = time.monotonic()
+    worktree_dir = ""
+
+    try:
+        # Staleness check
+        await _edit_msg(msg, f"<b>#{issue_num}</b> 🔄 Checking checkpoint freshness...")
+        impl_ref = checkpoint["ctx"].get("impl_snapshot_ref", "")
+
+        # Fetch latest main
+        fetch_proc = await asyncio.create_subprocess_exec(
+            "git", "fetch", "origin", "main",
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(fetch_proc.communicate(), timeout=30)
+
+        if impl_ref:
+            is_ancestor = await check_staleness(project_path, impl_ref)
+            if not is_ancestor:
+                await _edit_msg(
+                    msg,
+                    f"<b>#{issue_num}</b> ⚠️ Warning: main has advanced since checkpoint. "
+                    f"Proceeding anyway — merge conflicts are possible.",
+                    reply_markup=cancel_btn,
+                )
+
+        if cancel_event.is_set():
+            return
+
+        # Create worktree from checkpoint tag (reuse _git_fresh_start with custom ref)
+        git_ok, git_result = await _git_fresh_start(
+            project_path, branch_name, ref=tag_name, skip_fetch=True,
+        )
+        if not git_ok:
+            await _edit_msg(
+                msg,
+                f"<b>#{issue_num}</b> ❌ Failed to restore worktree from checkpoint:\n"
+                f"<pre>{_sanitize_output(git_result)}</pre>",
+            )
+            return
+
+        worktree_dir = git_result
+
+        # Restore context
+        ctx = restore_context(checkpoint)
+        ctx.project_path = worktree_dir
+
+        # Reset the failed step to pending so it gets re-run
+        for s in ctx.steps:
+            if s.status == "failed":
+                s.status = "pending"
+                s.detail = ""
+                s.elapsed_sec = 0.0
+
+        if cancel_event.is_set():
+            return
+
+        # Progress callback
+        async def progress_cb(status_text: str) -> None:
+            elapsed = int(time.monotonic() - pipeline_start)
+            mins, secs = divmod(elapsed, 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            try:
+                sys_status = await get_system_status()
+                sys_line = f"CPU: {sys_status.cpu_percent}% | RAM: {sys_status.ram_percent}%"
+            except Exception:
+                sys_line = ""
+            text = (
+                f"<b>#{issue_num}</b> 🔄 {html.escape(status_text)}\n"
+                f"[{time_str}] {sys_line}"
+            )
+            await _edit_msg(msg, text, reply_markup=cancel_btn)
+
+        # Run resumed pipeline
+        if pipeline_mode == "fivebrid":
+            ollama: OllamaProvider | None = context.bot_data.get("ollama")
+            gemini: GeminiCLIProvider | None = context.bot_data.get("gemini")
+            if not ollama or not gemini:
+                await _edit_msg(msg, f"<b>#{issue_num}</b> ❌ Fivebrid requires Ollama + Gemini")
+                return
+            status, detail = await run_fivebrid_pipeline(
+                ctx, ollama, gemini, settings, cancel_event, progress_cb,
+                project_info=project_info,
+                resume_from_step=failed_idx,
+            )
+        else:
+            ollama = context.bot_data.get("ollama")
+            anthropic: AnthropicProvider | None = context.bot_data.get("anthropic")
+            if not ollama:
+                await _edit_msg(msg, f"<b>#{issue_num}</b> ❌ Dual-check requires Ollama")
+                return
+            status, detail = await run_dual_check_pipeline(
+                ctx, ollama, anthropic, settings, cancel_event, progress_cb,
+                project_info=project_info,
+                resume_from_step=failed_idx,
+            )
+
+        elapsed = int(time.monotonic() - pipeline_start)
+        mins, secs = divmod(elapsed, 60)
+        total_time = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        if status == "success":
+            await _edit_msg(msg, f"<b>#{issue_num}</b> 🔄 Creating PR...")
+            pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
+
+            intent_summary = format_intent_summary(ctx)
+            step_summary = format_pipeline_summary(ctx)
+            if pr_url:
+                delete_checkpoint(project_name, issue_num)
+                await delete_checkpoint_tag(project_path, project_name, issue_num)
+                await _edit_msg(
+                    msg,
+                    f"<b>#{issue_num}</b> ✅ Retry succeeded in {total_time}\nPR: {pr_url}\n\n"
+                    f"{html.escape(intent_summary)}\n\n"
+                    f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
+                )
+            else:
+                await _edit_msg(
+                    msg,
+                    f"<b>#{issue_num}</b> — Retry passed but PR failed:\n"
+                    f"<pre>{_sanitize_output(pr_err)}</pre>\n\n"
+                    f"{html.escape(intent_summary)}\n\n"
+                    f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
+                )
+        else:
+            # Failed again — checkpoint is auto-updated in finally block
+            retry_hint = ""
+            if ctx and ctx.impl_snapshot_ref:
+                retry_hint = f"\n\n💡 <code>/retry {html.escape(project_name)} {issue_num}</code>"
+            intent_summary = format_intent_summary(ctx)
+            step_summary = format_pipeline_summary(ctx)
+            await _edit_msg(
+                msg,
+                f"<b>#{issue_num}</b> ❌ Retry {html.escape(status)}: {html.escape(detail[:200])}\n"
+                f"[{total_time}]\n\n"
+                f"{html.escape(intent_summary)}\n\n"
+                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}"
+                f"{retry_hint}",
+            )
+
+    except Exception as exc:
+        logger.exception("Error in retry for issue #%d", issue_num)
+        await _edit_msg(msg, f"<b>#{issue_num}</b> — Retry error: {html.escape(str(exc)[:200])}")
+    finally:
+        if worktree_dir:
+            await _save_checkpoint_on_failure(ctx, worktree_dir, project_name, issue_num, pipeline_mode)
+            await _cleanup_worktree(project_path, worktree_dir, branch_name)
+
+        # Clean up cancel events
+        events = _solve_cancels.get(chat_id, {})
+        events.pop(issue_num, None)
+        if not events:
+            _solve_cancels.pop(chat_id, None)
+        count = _solve_active.get(chat_id, 1) - 1
+        if count <= 0:
+            _solve_active.pop(chat_id, None)
+        else:
+            _solve_active[chat_id] = count
+
+
 # ── /help ────────────────────────────────────────────────────────────────────
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2571,6 +2931,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/plan &lt;project&gt; — Plan new development issues\n"
         "/issues &lt;project&gt; — Open GitHub issues (with Solve buttons)\n"
         "/solve &lt;project&gt; &lt;#&gt; [#...] — Auto-solve issues via Claude\n"
+        "/retry [project] [#] — Resume failed solve from checkpoint\n"
         "/rebase &lt;project&gt; &lt;pr#&gt; — Rebase PR onto latest main\n"
         "/discuss &lt;project&gt; &lt;question&gt; — Technical consultation with Opus\n"
         "/extract &lt;project&gt; &lt;file&gt; — Generate training data from file\n"

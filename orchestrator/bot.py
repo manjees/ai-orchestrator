@@ -31,6 +31,7 @@ from .handlers import (
     process_callback_handler,
     projects_handler,
     rebase_handler,
+    retry_handler,
     service_handler,
     solve_cancel_callback,
     solve_handler,
@@ -111,6 +112,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("plan", "Plan new issues for existing project"),
         BotCommand("discuss", "Technical consultation with Opus"),
         BotCommand("solve", "Auto-solve issues via Claude"),
+        BotCommand("retry", "Resume failed solve from checkpoint"),
         BotCommand("rebase", "Rebase PR onto main"),
         BotCommand("extract", "Generate training data from file"),
     ])
@@ -163,6 +165,7 @@ def create_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("projects", projects_handler, filters=auth))
     app.add_handler(CommandHandler("issues", issues_handler, filters=auth))
     app.add_handler(CommandHandler("solve", solve_handler, filters=auth))
+    app.add_handler(CommandHandler("retry", retry_handler, filters=auth))
     app.add_handler(CommandHandler("init", init_handler, filters=auth))
     app.add_handler(CommandHandler("plan", plan_handler, filters=auth))
     app.add_handler(CommandHandler("discuss", discuss_handler, filters=auth))

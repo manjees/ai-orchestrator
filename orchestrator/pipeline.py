@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import httpx
+
 from .ai.base import AIResponse, Message, Role
 from .ai.anthropic_provider import AnthropicProvider
 from .ai.gemini_provider import GeminiCLIProvider
@@ -70,6 +72,18 @@ class PipelineContext:
     ci_fix_history: list[str] = field(default_factory=list)
     audit_fix_history: list[str] = field(default_factory=list)
     steps: list[PipelineStep] = field(default_factory=list)
+
+
+# ── Exception Detail Helper ──────────────────────────────────────────────────
+
+def _exc_detail(exc: Exception, max_chars: int = 200) -> str:
+    """Return a human-readable exception detail, never empty."""
+    msg = str(exc).strip()
+    if msg:
+        return msg[:max_chars]
+    # Fallback: type name + repr for exceptions with empty str() (e.g. TimeoutError, CancelledError)
+    type_name = type(exc).__name__
+    return f"{type_name}: {repr(exc)}"[:max_chars]
 
 
 # ── Verdict Parsing ──────────────────────────────────────────────────────────
@@ -387,7 +401,14 @@ async def _call_ollama_with_progress(
         elapsed += 10
         mins, secs = divmod(elapsed, 60)
         await progress_cb(f"{step_name} (Thinking... {mins}m {secs}s)")
-    return task.result()
+    try:
+        return task.result()
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as exc:
+        raise type(exc)(f"Ollama {step_name} timed out after {elapsed}s") from exc
+    except httpx.HTTPStatusError:
+        raise
+    except (asyncio.CancelledError, asyncio.TimeoutError) as exc:
+        raise type(exc)(f"Ollama {step_name} cancelled/timed out after {elapsed}s") from exc
 
 
 # ── Claude CLI Progress Helper ───────────────────────────────────────────────
@@ -464,7 +485,10 @@ async def _call_gemini_with_progress(
         elapsed += 10
         mins, secs = divmod(elapsed, 60)
         await progress_cb(f"{step_name} (Thinking... {mins}m {secs}s)")
-    return task.result()
+    try:
+        return task.result()
+    except (asyncio.CancelledError, asyncio.TimeoutError) as exc:
+        raise type(exc)(f"Gemini {step_name} cancelled/timed out after {elapsed}s") from exc
 
 
 # ── Step Functions ────────────────────────────────────────────────────────────
@@ -536,7 +560,7 @@ async def step_deepseek_design(
         step.detail = f"{response.output_tokens} tokens"
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -717,7 +741,7 @@ async def step_claude_implement(
         raise
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -808,7 +832,7 @@ async def step_claude_review(
     except Exception as exc:
         ctx.review_passed = False
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         logger.warning("Claude review error for issue #%d: %s", ctx.issue_num, exc)
     finally:
         tick_task.cancel()
@@ -878,7 +902,7 @@ async def step_deepseek_audit(
         raise
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -983,7 +1007,7 @@ async def step_ai_audit(
         raise
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -1125,7 +1149,7 @@ async def step_haiku_research(
         step.detail = f"{len(output)} chars"
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -1180,7 +1204,7 @@ async def step_opus_design(
         step.detail = f"{len(output)} chars"
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -1486,6 +1510,7 @@ async def run_fivebrid_pipeline(
     cancel_event: asyncio.Event,
     progress_cb: ProgressCallback,
     project_info: dict | None = None,
+    resume_from_step: int = -1,
 ) -> tuple[str, str]:
     """Run the 9-step Five-brid pipeline (10 with Local CI Check). Returns (status, detail)."""
 
@@ -1510,10 +1535,18 @@ async def run_fivebrid_pipeline(
         ]
         ctx.steps = steps
 
+    resuming = resume_from_step >= 0
+
+    def _step_done(idx: int) -> bool:
+        return _is_step_done(ctx, idx, resuming)
+
     try:
         # Fetch issue
-        await progress_cb("Fetching issue...")
-        await step_fetch_issue(ctx)
+        if resuming and ctx.issue_body:
+            await progress_cb("Issue data restored from checkpoint")
+        else:
+            await progress_cb("Fetching issue...")
+            await step_fetch_issue(ctx)
 
         total_steps = len(ctx.steps)
 
@@ -1521,54 +1554,60 @@ async def run_fivebrid_pipeline(
             return "skipped", "Cancelled by user"
 
         # ── Phase 0: Research ──
-        await progress_cb(f"[0/{total_steps}] Haiku Research...")
-        await step_haiku_research(ctx, settings, progress_cb, step_index=0)
+        if _step_done(0):
+            await progress_cb(f"[0/{total_steps}] Haiku Research (cached)")
+        else:
+            await progress_cb(f"[0/{total_steps}] Haiku Research...")
+            await step_haiku_research(ctx, settings, progress_cb, step_index=0)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
         # ── Phase A: Design Loop ──
-        for iteration in range(settings.max_design_retries + 1):
-            ctx.design_iteration = iteration
+        if not resuming or not _step_done(1):
+            for iteration in range(settings.max_design_retries + 1):
+                ctx.design_iteration = iteration
 
-            if cancel_event.is_set():
-                return "skipped", "Cancelled by user"
+                if cancel_event.is_set():
+                    return "skipped", "Cancelled by user"
 
-            # Step 1: Opus Design
-            step_label = f" (iteration {iteration + 1})" if iteration > 0 else ""
-            await progress_cb(f"[1/{total_steps}] Opus Design{step_label}...")
+                # Step 1: Opus Design
+                step_label = f" (iteration {iteration + 1})" if iteration > 0 else ""
+                await progress_cb(f"[1/{total_steps}] Opus Design{step_label}...")
 
-            if iteration > 0:
-                # Insert new design + critique step pairs after previous critique
-                # Previous critique is at index 2 + (iteration-1)*2
-                insert_at = 3 + (iteration - 1) * 2
-                ctx.steps.insert(insert_at, PipelineStep(name=f"Opus Design (retry {iteration})"))
-                ctx.steps.insert(insert_at + 1, PipelineStep(name=f"Gemini Critique (retry {iteration})"))
-                total_steps = len(ctx.steps)
+                if iteration > 0:
+                    # Insert new design + critique step pairs after previous critique
+                    # Previous critique is at index 2 + (iteration-1)*2
+                    insert_at = 3 + (iteration - 1) * 2
+                    ctx.steps.insert(insert_at, PipelineStep(name=f"Opus Design (retry {iteration})"))
+                    ctx.steps.insert(insert_at + 1, PipelineStep(name=f"Gemini Critique (retry {iteration})"))
+                    total_steps = len(ctx.steps)
 
-            design_idx = 1 + (iteration * 2)
-            await step_opus_design(ctx, settings, progress_cb, step_index=design_idx)
+                design_idx = 1 + (iteration * 2)
+                await step_opus_design(ctx, settings, progress_cb, step_index=design_idx)
 
-            if cancel_event.is_set():
-                return "skipped", "Cancelled by user"
+                if cancel_event.is_set():
+                    return "skipped", "Cancelled by user"
 
-            # Step 2: Gemini Design Critique (non-fatal)
-            critique_idx = design_idx + 1
-            await progress_cb(f"[2/{total_steps}] Gemini Design Critique{step_label}...")
-            await step_gemini_design_critique(
-                ctx, gemini, settings, progress_cb, step_index=critique_idx,
-            )
+                # Step 2: Gemini Design Critique (non-fatal)
+                critique_idx = design_idx + 1
+                await progress_cb(f"[2/{total_steps}] Gemini Design Critique{step_label}...")
+                await step_gemini_design_critique(
+                    ctx, gemini, settings, progress_cb, step_index=critique_idx,
+                )
 
-            critique_step = ctx.steps[critique_idx]
-            # Check if critique says NEEDS_REVISION and we have retries left
-            if critique_step.status == "failed" and "NEEDS_REVISION" in critique_step.detail:
-                if iteration < settings.max_design_retries:
-                    await progress_cb(
-                        f"Design needs revision (iteration {iteration + 1}/{settings.max_design_retries + 1}), retrying..."
-                    )
-                    continue
-            # APPROVED, skipped, or no more retries — proceed
-            break
+                critique_step = ctx.steps[critique_idx]
+                # Check if critique says NEEDS_REVISION and we have retries left
+                if critique_step.status == "failed" and "NEEDS_REVISION" in critique_step.detail:
+                    if iteration < settings.max_design_retries:
+                        await progress_cb(
+                            f"Design needs revision (iteration {iteration + 1}/{settings.max_design_retries + 1}), retrying..."
+                        )
+                        continue
+                # APPROVED, skipped, or no more retries — proceed
+                break
+        else:
+            await progress_cb(f"[1/{total_steps}] Design phase (cached)")
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
@@ -1581,28 +1620,35 @@ async def run_fivebrid_pipeline(
         impl_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Implement")
 
         # Step 3: Qwen Hints (non-fatal)
-        try:
-            await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement...")
-            await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=qwen_idx)
-        except Exception as exc:
-            logger.warning("Qwen pre-implement failed (non-fatal): %s", exc)
+        if _step_done(qwen_idx):
+            await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement (cached)")
+        else:
+            try:
+                await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement...")
+                await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=qwen_idx)
+            except Exception as exc:
+                logger.warning("Qwen pre-implement failed (non-fatal): %s", exc)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
         # Step 4: Sonnet Implement (uses existing step_claude_implement)
-        await progress_cb(f"[4/{total_steps}] Sonnet Implement...")
-        await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
+        if _step_done(impl_idx):
+            await progress_cb(f"[4/{total_steps}] Sonnet Implement (cached)")
+        else:
+            await progress_cb(f"[4/{total_steps}] Sonnet Implement...")
+            await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
 
         # Capture snapshot ref for safe-fail recovery
-        snap_proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "HEAD",
-            cwd=ctx.project_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        snap_out, _ = await asyncio.wait_for(snap_proc.communicate(), timeout=5)
-        ctx.impl_snapshot_ref = snap_out.decode().strip() if snap_out else ""
+        if not (resuming and ctx.impl_snapshot_ref):
+            snap_proc = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", "HEAD",
+                cwd=ctx.project_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            snap_out, _ = await asyncio.wait_for(snap_proc.communicate(), timeout=5)
+            ctx.impl_snapshot_ref = snap_out.decode().strip() if snap_out else ""
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
@@ -1610,8 +1656,11 @@ async def run_fivebrid_pipeline(
         # Step 5 (optional): Local CI Check
         if ci_commands:
             ci_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Local CI Check")
-            await progress_cb(f"[5/{total_steps}] Local CI Check...")
-            await step_local_ci_check(ctx, settings, progress_cb, ci_commands, step_index=ci_idx)
+            if _step_done(ci_idx):
+                await progress_cb(f"[5/{total_steps}] Local CI Check (cached)")
+            else:
+                await progress_cb(f"[5/{total_steps}] Local CI Check...")
+                await step_local_ci_check(ctx, settings, progress_cb, ci_commands, step_index=ci_idx)
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
@@ -1620,8 +1669,11 @@ async def run_fivebrid_pipeline(
         self_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Self-Review")
 
         # Step 5/6: Sonnet Self-Review (safe-fail)
-        await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review...")
-        await step_sonnet_self_review(ctx, settings, cancel_event, progress_cb, step_index=self_review_idx)
+        if _step_done(self_review_idx):
+            await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review (cached)")
+        else:
+            await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review...")
+            await step_sonnet_self_review(ctx, settings, cancel_event, progress_cb, step_index=self_review_idx)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
@@ -1631,8 +1683,11 @@ async def run_fivebrid_pipeline(
         audit_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "AI Audit")
 
         # Gemini Cross-Review (non-fatal)
-        await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review...")
-        await step_gemini_cross_review(ctx, gemini, settings, progress_cb, step_index=cross_review_idx)
+        if _step_done(cross_review_idx):
+            await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review (cached)")
+        else:
+            await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review...")
+            await step_gemini_cross_review(ctx, gemini, settings, progress_cb, step_index=cross_review_idx)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
@@ -1709,9 +1764,14 @@ async def run_dual_check_pipeline(
     cancel_event: asyncio.Event,
     progress_cb: ProgressCallback,
     project_info: dict | None = None,
+    resume_from_step: int = -1,
 ) -> tuple[str, str]:
     """Run the full 6-step pipeline with automatic retry on review failure. Returns (status, detail)."""
     max_retries = settings.max_review_retries
+    resuming = resume_from_step >= 0
+
+    def _step_done(idx: int) -> bool:
+        return _is_step_done(ctx, idx, resuming)
 
     # Resolve CI commands once at start
     ci_commands = _resolve_ci_commands(ctx.project_path, project_info) if settings.local_ci_enabled else []
@@ -1733,25 +1793,34 @@ async def run_dual_check_pipeline(
 
     try:
         # Fetch issue
-        await progress_cb("Fetching issue...")
-        await step_fetch_issue(ctx)
+        if resuming and ctx.issue_body:
+            await progress_cb("Issue data restored from checkpoint")
+        else:
+            await progress_cb("Fetching issue...")
+            await step_fetch_issue(ctx)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
         # Step 1: DeepSeek Design (once)
-        await progress_cb("[1/6] DeepSeek Design...")
-        await step_deepseek_design(ctx, ollama, settings, progress_cb)
+        if _step_done(0):
+            await progress_cb("[1/6] DeepSeek Design (cached)")
+        else:
+            await progress_cb("[1/6] DeepSeek Design...")
+            await step_deepseek_design(ctx, ollama, settings, progress_cb)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
         # Step 1.5: Qwen Pre-Implement (non-fatal)
-        try:
-            await progress_cb("[1.5/6] Qwen Pre-Implement...")
-            await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=1)
-        except Exception as exc:
-            logger.warning("Qwen pre-implement step failed (non-fatal): %s", exc)
+        if _step_done(1):
+            await progress_cb("[1.5/6] Qwen Pre-Implement (cached)")
+        else:
+            try:
+                await progress_cb("[1.5/6] Qwen Pre-Implement...")
+                await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=1)
+            except Exception as exc:
+                logger.warning("Qwen pre-implement step failed (non-fatal): %s", exc)
 
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
@@ -1876,6 +1945,11 @@ async def run_dual_check_pipeline(
 
 
 # ── Internal Helpers ─────────────────────────────────────────────────────────
+
+def _is_step_done(ctx: PipelineContext, idx: int, resuming: bool) -> bool:
+    """Check if a step was already completed (for resume)."""
+    return resuming and idx < len(ctx.steps) and ctx.steps[idx].status == "passed"
+
 
 async def _reset_to_snapshot(project_path: str, snapshot_ref: str) -> None:
     """Reset worktree to a specific commit snapshot (safe-fail recovery)."""
@@ -2101,7 +2175,7 @@ async def step_init_stack_scout(
         step.detail = f"{len(output)} chars"
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -2180,7 +2254,7 @@ async def step_init_architecting(
         step.detail = f"CLAUDE.md: {len(ctx.claude_md)} chars, agents.md: {len(ctx.agents_md)} chars"
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -2256,7 +2330,7 @@ async def step_init_execution(
         step.detail = ctx.repo_url or "dir created (no URL extracted)"
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
@@ -2378,7 +2452,7 @@ async def step_init_ci_watch(
         raise
     except Exception as exc:
         step.status = "failed"
-        step.detail = str(exc)[:200]
+        step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
