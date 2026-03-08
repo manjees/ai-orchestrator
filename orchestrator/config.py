@@ -145,6 +145,14 @@ class Settings(BaseSettings):
     split_timeout: int = 120       # Opus split analysis (seconds)
     strategy_approval_timeout: int = 300  # User approval wait (5 min)
 
+    # Staggered Parallelism
+    stagger_gate_timeout: int = 3600   # dependency wait (60 min)
+    dep_triage_timeout: int = 60       # Haiku dependency analysis (seconds)
+
+    # Supreme Court
+    supreme_court_timeout: int = 600    # Gemini mediation (10 min)
+    supreme_court_user_timeout: int = 300  # user decision wait (5 min)
+
     # AI Auditor (Intent-Based Cross-Model Audit)
     ai_audit_enabled: bool = True
     ai_audit_timeout: int = 1200          # 20분 (R1 reasoning + 32K context)

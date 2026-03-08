@@ -38,6 +38,7 @@ from .handlers import (
     solve_inline_callback,
     status_handler,
     strategy_callback,
+    supreme_court_callback,
     view_handler,
 )
 from .security import AuthFilter
@@ -112,7 +113,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("init", "Bootstrap a new project"),
         BotCommand("plan", "Plan new issues for existing project"),
         BotCommand("discuss", "Technical consultation with Opus"),
-        BotCommand("solve", "Auto-solve issues via Claude"),
+        BotCommand("solve", "Auto-solve issues via Claude (--parallel for staggered)"),
         BotCommand("retry", "Resume failed solve from checkpoint"),
         BotCommand("rebase", "Rebase PR onto main"),
         BotCommand("extract", "Generate training data from file"),
@@ -183,6 +184,7 @@ def create_application(settings: Settings) -> Application:
     app.add_handler(CallbackQueryHandler(discuss_cancel_callback, pattern=r"^cancel_discuss:"))
     app.add_handler(CallbackQueryHandler(discuss_create_issues_callback, pattern=r"^discuss_issues:"))
     app.add_handler(CallbackQueryHandler(strategy_callback, pattern=r"^strategy_"))
+    app.add_handler(CallbackQueryHandler(supreme_court_callback, pattern=r"^court_"))
 
     # Global error handler — never let exceptions kill the bot
     app.add_error_handler(_error_handler)

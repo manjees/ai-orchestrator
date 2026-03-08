@@ -76,6 +76,10 @@ class PipelineContext:
     triage_reason: str = ""  # Haiku triage reasoning
     split_plan: str = ""     # Opus split proposal (empty if not needed)
     steps: list[PipelineStep] = field(default_factory=list)
+    # Supreme Court fields
+    supreme_court_ruling: str = ""
+    draft_context_diff: str = ""
+    predecessor_issue_num: int = 0
 
 
 # ── Exception Detail Helper ──────────────────────────────────────────────────
@@ -124,6 +128,21 @@ def parse_audit(text: str) -> bool | None:
     if matches:
         return matches[-1].group(1).upper() == "PASS"
     return None
+
+
+def parse_ruling(text: str) -> str:
+    """Extract [RULING: UPHOLD/OVERTURN/REDESIGN] from Supreme Court output."""
+    match = re.search(r"\[RULING:\s*(UPHOLD|OVERTURN|REDESIGN)\]", text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    text_upper = text.upper()
+    if "OVERTURN" in text_upper:
+        return "OVERTURN"
+    if "REDESIGN" in text_upper:
+        return "REDESIGN"
+    if "UPHOLD" in text_upper:
+        return "UPHOLD"
+    return "UPHOLD"
 
 
 # ── Git Diff Filtering ───────────────────────────────────────────────────────
@@ -824,6 +843,9 @@ async def step_claude_implement(
         f"- Only commit your changes locally. Branch management and PR creation are handled externally."
     )
 
+    if ctx.draft_context_diff:
+        prompt += f"\n\n{ctx.draft_context_diff}\n"
+
     if ctx.review_feedback:
         prompt += (
             f"\n\n--- Previous Review Feedback (MUST address these issues) ---\n"
@@ -1100,9 +1122,12 @@ async def step_ai_audit(
             claude_md_content = "(could not read CLAUDE.md)"
 
     system_prompt = (
-        "You are an adversarial code auditor. Your job is to FIND FLAWS, "
-        "not to praise. Assume the implementer made mistakes. "
-        "Think like an attacker exploiting this code in production."
+        "You are an adversarial code auditor with the personality of a brutally honest "
+        "senior developer. Your job is to FIND FLAWS, not to praise. "
+        "Assume the implementer made mistakes. Think like an attacker exploiting this code.\n\n"
+        "When you find 'what' comments (comments that describe what the code does instead of why), "
+        "mock them like a senior developer would: 'Oh great, // increment counter — "
+        "I never would have guessed that i++ increments a counter. Delete this noise.'"
     )
 
     user_content = (
@@ -1122,8 +1147,18 @@ async def step_ai_audit(
         "2. LOGIC FLAWS: Edge cases, race conditions, off-by-one errors the implementer likely missed.\n"
         "3. SECURITY: Injection, XSS, auth bypass, data exposure vulnerabilities.\n"
         "4. GUIDELINE VIOLATIONS: Does the code violate CLAUDE.md conventions?\n"
-        "   - COMMENT POLICY: If the code contains 'what' comments instead of 'why' comments, mark as [MAJOR].\n"
-        "     Only 'why' comments are allowed. Self-documenting naming is mandatory.\n\n"
+        "5. COMMENT AUDIT (MANDATORY — zero tolerance for 'what' comments):\n"
+        "   Examine EVERY comment in the diff. For each comment:\n"
+        "   - If it describes WHAT the code does → [MAJOR] violation. "
+        "     Provide a sarcastic correction explaining why this comment is noise. "
+        "     The code should be self-documenting with clear naming.\n"
+        "   - If it explains WHY (design decision, non-obvious constraint, "
+        "     business rule, workaround reason) → ACCEPTABLE.\n"
+        "   - If no comments exist and the code is self-explanatory → ACCEPTABLE.\n"
+        "   - Examples of INEXCUSABLE comments: '// increment counter', '// set user name', "
+        "'// loop through items', '// check if null', '// create instance', '// return result'\n"
+        "   - Examples of GOOD comments: '// OAuth spec requires nonce per-request', "
+        "'// Workaround for SQLite 3.x locking bug', '// Business rule: 30-day retention'\n\n"
         "For each finding, classify as [CRITICAL], [MAJOR], or [MINOR].\n\n"
         "End with exactly one of:\n"
         "[AUDIT: PASS] — no critical or major issues\n"
@@ -1181,6 +1216,100 @@ async def step_ai_audit(
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
+
+
+# ── Supreme Court ────────────────────────────────────────────────────────
+
+async def step_supreme_court(
+    ctx: PipelineContext,
+    gemini: GeminiCLIProvider,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+) -> str:
+    """Gemini mediates when Sonnet (PASS) conflicts with DeepSeek (FAIL).
+
+    Returns ruling: "UPHOLD" | "OVERTURN" | "REDESIGN"
+    """
+    prompt = (
+        "You are a Supreme Court judge mediating a conflict between two AI reviewers.\n\n"
+        f"## Issue\n#{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body[:2000]}\n\n"
+        f"## Implementation Diff\n{ctx.git_diff[:4000]}\n\n"
+        f"## Self-Review (Sonnet) — VERDICT: PASS\n{ctx.self_review_report[:2000]}\n\n"
+        f"## AI Audit (DeepSeek R1) — VERDICT: FAIL\n{ctx.ai_audit_result[:2000]}\n\n"
+        "Analyze both reviews carefully:\n"
+        "1. Is the Audit's FAIL justified? Are the critical issues real?\n"
+        "2. Is the Self-Review's PASS justified? Did it miss real issues?\n"
+        "3. Could both be partially right?\n\n"
+        "CRITICAL INSTRUCTION: You MUST conclude with exactly ONE ruling. "
+        "Do NOT hedge or say 'both have valid points without choosing'. "
+        "Even if both sides have merit, you must pick the BEST option.\n\n"
+        "Reply with exactly one of:\n"
+        "[RULING: UPHOLD] — Audit is correct, implementation needs fixes\n"
+        "[RULING: OVERTURN] — Self-review is correct, audit findings are false positives\n"
+        "[RULING: REDESIGN] — Both reviews expose fundamental design issues\n\n"
+        "Then explain your reasoning in 2-3 sentences."
+    )
+
+    try:
+        output = await gemini.generate(prompt, timeout=settings.supreme_court_timeout)
+        ctx.supreme_court_ruling = output
+        return parse_ruling(output)
+    except Exception as exc:
+        logger.warning("Supreme Court failed: %s", exc)
+        ctx.supreme_court_ruling = f"Error: {exc}"
+        return "UPHOLD"
+
+
+# ── State Sync Helpers ───────────────────────────────────────────────────
+
+async def _extract_decisions_llm(
+    ctx: PipelineContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+) -> list[str]:
+    """Extract key architectural decisions from design doc using Haiku."""
+    if not ctx.design_doc:
+        return []
+    try:
+        prompt = (
+            "Extract the key architectural/design DECISIONS from this design document. "
+            "Focus on WHY choices were made (library selection, pattern choice, tradeoffs).\n"
+            "Return 3-7 bullet points, each starting with '-'.\n"
+            "Only include actual decisions, not descriptions of what the code does.\n\n"
+            f"{ctx.design_doc[:3000]}"
+        )
+        output = await _call_claude_cli_with_progress(
+            prompt,
+            model=settings.haiku_model,
+            timeout=30,
+            progress_cb=progress_cb,
+            step_name="State Sync",
+        )
+        decisions = []
+        for line in output.strip().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                decisions.append(stripped[2:])
+        return decisions[:7]
+    except Exception:
+        decisions = []
+        for line in ctx.design_doc.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- ") and any(
+                kw in stripped.lower()
+                for kw in ("chose", "decided", "approach", "pattern", "strategy", "because", "using", "instead of")
+            ):
+                decisions.append(stripped[2:])
+        return decisions[:10]
+
+
+def _extract_files_from_diff(diff: str) -> list[str]:
+    """Extract file paths from git diff output."""
+    files = []
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            files.append(line[6:])
+    return files
 
 
 # ── Data Mining ──────────────────────────────────────────────────────────────
@@ -1359,6 +1488,9 @@ async def step_opus_design(
         f"implementation details (step 3). Tests define the expected behavior.\n\n"
         f"Be specific and actionable — this document will guide the implementation directly."
     )
+
+    if ctx.draft_context_diff:
+        prompt += f"\n\n{ctx.draft_context_diff}\n"
 
     try:
         output = await _call_claude_cli_with_progress(
@@ -1681,8 +1813,11 @@ async def run_fivebrid_pipeline(
     progress_cb: ProgressCallback,
     project_info: dict | None = None,
     resume_from_step: int = -1,
+    scheduler: "StaggeredScheduler | None" = None,
+    supreme_court_cb: Callable | None = None,
 ) -> tuple[str, str]:
     """Run the adaptive Five-brid pipeline. Returns (status, detail)."""
+    from .scheduler import StaggeredScheduler  # noqa: F811
 
     # Resolve CI commands once at start
     ci_commands = _resolve_ci_commands(ctx.project_path, project_info) if settings.local_ci_enabled else []
@@ -1731,6 +1866,12 @@ async def run_fivebrid_pipeline(
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
+
+        # ── Inject State Context from prior issues ──
+        from .state_sync import format_state_context
+        state_ctx = format_state_context(ctx.project_path)
+        if state_ctx:
+            ctx.draft_context_diff = state_ctx
 
         # ── Phase A: Design Loop ──
         design_idx = _find_step("Opus Design")
@@ -1827,7 +1968,13 @@ async def run_fivebrid_pipeline(
             snap_out, _ = await asyncio.wait_for(snap_proc.communicate(), timeout=5)
             ctx.impl_snapshot_ref = snap_out.decode().strip() if snap_out else ""
 
+        # Notify scheduler: implement done
+        if scheduler:
+            scheduler.notify_implement_done(ctx.issue_num)
+
         if cancel_event.is_set():
+            if scheduler:
+                scheduler.notify_audit_failed(ctx.issue_num)
             return "skipped", "Cancelled by user"
 
         # Local CI Check (optional)
@@ -1869,6 +2016,16 @@ async def run_fivebrid_pipeline(
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
 
+        # Wait-Gate: wait for dependency audit approval before starting audit
+        if scheduler:
+            await progress_cb("Waiting for dependency audit approval...")
+            deps_ok = await scheduler.wait_dependencies(
+                ctx.issue_num, timeout=settings.stagger_gate_timeout,
+            )
+            if not deps_ok:
+                scheduler.notify_audit_failed(ctx.issue_num)
+                return "failed", "Dependency wait timed out or dependency failed"
+
         # AI Audit (optional, with retry loop)
         audit_idx = _find_step("AI Audit")
         if audit_idx is not None and effective_ai_audit_enabled:
@@ -1876,6 +2033,8 @@ async def run_fivebrid_pipeline(
 
             for audit_attempt in range(effective_ai_audit_max_retries + 1):
                 if cancel_event.is_set():
+                    if scheduler:
+                        scheduler.notify_audit_failed(ctx.issue_num)
                     return "skipped", "Cancelled by user"
 
                 audit_label = f" (retry {audit_attempt})" if audit_attempt > 0 else ""
@@ -1885,6 +2044,27 @@ async def run_fivebrid_pipeline(
                     await step_ai_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
                     break  # PASS
                 except RuntimeError:
+                    # Supreme Court: self-review PASS vs audit FAIL
+                    if ctx.self_review_report and parse_verdict(ctx.self_review_report) is True:
+                        await progress_cb("Conflict detected — Supreme Court (Gemini)...")
+                        ruling = await step_supreme_court(ctx, gemini, settings, progress_cb)
+
+                        if supreme_court_cb:
+                            user_decision = await supreme_court_cb(ctx, ruling)
+                        else:
+                            user_decision = ruling.lower()
+
+                        if user_decision == "overturn":
+                            ctx.ai_audit_passed = True
+                            ctx.steps[audit_idx].status = "passed"
+                            ctx.steps[audit_idx].detail = "OVERTURNED by Supreme Court"
+                            break
+                        elif user_decision == "redesign":
+                            if scheduler:
+                                scheduler.notify_audit_failed(ctx.issue_num)
+                            return "failed", "Supreme Court: REDESIGN required"
+                        # else "uphold" → continue normal retry
+
                     if audit_attempt < effective_ai_audit_max_retries:
                         ctx.audit_fix_history.append(
                             f"audit retry {audit_attempt + 1}: {ctx.ai_audit_result[:200]}"
@@ -1912,6 +2092,20 @@ async def run_fivebrid_pipeline(
             # AI Audit skipped for this mode
             ctx.ai_audit_passed = True
 
+        # Notify scheduler: audit approved
+        if scheduler:
+            scheduler.notify_audit_approved(ctx.issue_num)
+
+        # ── State Sync: record decisions after audit approval ──
+        if ctx.ai_audit_passed or not effective_ai_audit_enabled:
+            try:
+                from .state_sync import append_project_summary
+                decisions = await _extract_decisions_llm(ctx, settings, progress_cb)
+                files = _extract_files_from_diff(ctx.git_diff)
+                append_project_summary(ctx.project_path, ctx.issue_num, ctx.issue_title, decisions, files)
+            except Exception:
+                logger.warning("State sync failed (non-fatal)")
+
         # ── Phase D: Post-Process ──
         if settings.enable_data_mining and (ctx.ai_audit_passed or not effective_ai_audit_enabled):
             data_mining_idx = _find_step("Data Mining")
@@ -1933,6 +2127,10 @@ async def run_fivebrid_pipeline(
             if s.status == "failed":
                 return "failed", f"{s.name}: {s.detail}"
         return "failed", str(exc)[:200]
+    finally:
+        # Ensure scheduler is notified on any exit path (set() is idempotent)
+        if scheduler and not ctx.ai_audit_passed:
+            scheduler.notify_audit_failed(ctx.issue_num)
 
 
 # ── Legacy Orchestrator ──────────────────────────────────────────────────────

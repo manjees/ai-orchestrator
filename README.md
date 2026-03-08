@@ -1,6 +1,6 @@
-# AI Orchestrator
+# AI Orchestrator v9.5 — Supreme Commander
 
-Telegram bot that turns a Mac Mini into a remote AI-powered development server. **Bootstrap new projects**, auto-solve GitHub issues, and control system monitoring — all from your phone.
+Telegram bot that turns a Mac Mini into a remote AI-powered development server. **Bootstrap new projects**, auto-solve GitHub issues with staggered parallelism, and control system monitoring — all from your phone.
 
 ## Architecture
 
@@ -17,19 +17,50 @@ Telegram  ──>  Bot (python-telegram-bot)
                     │                ├── Execution (Sonnet CLI)
                     │                ├── CI Watch + Auto-Fix (Sonnet CLI)
                     │                └── Issue Planning (Opus CLI)
-                    ├── /solve  ──>  Five-brid Pipeline (9-step, 5 models)
+                    ├── /solve  ──>  Adaptive Pipeline (express/standard/full)
+                    │                ├── Triage + Split Detection (Haiku)
                     │                ├── Haiku Research (Claude CLI)
-                    │                ├── Opus Design (Claude CLI)
+                    │                ├── Opus Design (Claude CLI) + State Sync
                     │                ├── Gemini Critique (Gemini CLI, loop)
                     │                ├── Qwen Hints (Ollama)
                     │                ├── Sonnet Implement (Claude CLI)
-                    │                ├── Sonnet Self-Review (Claude CLI, safe-fail)
+                    │                ├── Local CI Check + Auto-Fix
+                    │                ├── Sonnet Self-Review (Claude CLI)
                     │                ├── Gemini Cross-Review (Gemini CLI)
-                    │                ├── DeepSeek Audit (Ollama)
+                    │                ├── AI Audit (DeepSeek R1, strict Why policy)
+                    │                ├── Supreme Court (Gemini, on conflict)
                     │                └── Data Mining (Ollama, conditional)
-                    ├── /solve  ──>  Legacy Triple-Model Pipeline (5-step)
+                    ├── /solve --parallel ──>  Staggered Parallel Solve
+                    │                ├── Dependency Triage (Haiku, all issues)
+                    │                ├── File Conflict Detection
+                    │                ├── Staggered Execution (Wait-Gates)
+                    │                └── State Sync (project_summary.json)
                     ├── /extract ──>  Training data generation (Qwen)
                     └── /rebase  ──>  Auto conflict resolution (Claude CLI)
+```
+
+## End-to-End Flow (Staggered Parallel)
+
+```
+/solve project 1 2 3 --parallel
+  │
+  ├─ 1. Dependency-aware Triage (Haiku → all issues analyzed together)
+  │     → Issue #1: independent | Issue #2: depends on #1 | Issue #3: independent
+  │
+  ├─ 2. Staggered Execution
+  │     Issue #1: Research → Design → Implement ─── Audit ─── Done
+  │     Issue #3: Research → Design → Implement ─┐ (Wait-Gate) ─── Audit ─── Done
+  │     Issue #2:                    (Wait for #1 Audit)─── Research → Design → ...
+  │
+  ├─ 3. Audit Phase
+  │     Sonnet Self-Review: PASS ─┐
+  │     DeepSeek R1 Audit:  FAIL ─┤ → Supreme Court (Gemini) → User Decision
+  │
+  ├─ 4. State Sync
+  │     → project_summary.json accumulates design decisions
+  │     → Injected into subsequent issues' Design/Implement prompts
+  │
+  └─ 5. PR Creation + Results
 ```
 
 ## Features
@@ -41,31 +72,50 @@ Telegram  ──>  Bot (python-telegram-bot)
 - `/service` — launchd service control (start/stop/restart/logs)
 
 ### AI-Powered Development
-- `/init [--public|--private] <name> <description>` — Bootstrap a new project (stack research → scaffold → GitHub → issues)
+- `/init [--public|--private] <name> <description>` — Bootstrap a new project
 - `/issues <project>` — List open GitHub issues with inline Solve buttons
-- `/solve <project> <#> [#...]` — Auto-solve issues via configurable pipeline
-- `/rebase <project> <pr#>` — Rebase PR onto main, auto-resolve conflicts with Claude
-- `/extract <project> <file>` — Generate JSONL training data from a source file
+- `/solve <project> <#> [#...] [--fast|--std|--full] [--parallel]` — Auto-solve issues
+- `/retry [project] [#]` — Resume failed solve from checkpoint
+- `/rebase <project> <pr#>` — Rebase PR onto main, auto-resolve conflicts
+- `/plan <project>` — Plan new development issues
+- `/discuss <project> <question>` — Technical consultation with Opus
+- `/extract <project> <file>` — Generate JSONL training data
 
-### Typical Workflow
+### Adaptive Pipeline Modes
 
-```
-/init --public my-app A KMP mobile app for task management
-  → Stack Scout → CLAUDE.md → Scaffold + GitHub repo (public) → 7 issues created
-  → projects.json auto-registered
+| Mode | Flag | Steps | Design Retries | CI Retries | AI Audit | ETA |
+|------|------|-------|----------------|------------|----------|-----|
+| Express | `--fast` | 3-Step | 0 | 2 | No | 5-15 min |
+| Standard | `--std` | 6-Step | 2 | 5 | Yes (3x) | 15-40 min |
+| Full | `--full` | 9-Step | 3 | 7 | Yes (5x) | 30-90 min |
+| Auto | (default) | Haiku decides | Per mode | Per mode | Per mode | Varies |
 
-/issues my-app
-  → #1 Setup Gradle build system  [Solve]
-  → #2 Implement shared module     [Solve]
-  → ...
+### Staggered Parallel Solve (`--parallel`)
 
-/solve my-app 1 2 3
-  → Parallel solve via Five-brid pipeline → PRs created
-```
+When solving multiple issues with `--parallel`, the scheduler:
+
+1. **Dependency Triage** — Haiku analyzes all issues together for inter-dependencies
+2. **File Conflict Detection** — Issues modifying the same files are automatically sequenced
+3. **Staggered Execution** — Independent issues run in parallel; dependent issues wait at gates
+4. **State Sync** — Design decisions accumulate in `project_summary.json` and are injected into subsequent issues
+
+### Supreme Court (Conflict Resolution)
+
+When Self-Review (Sonnet) returns PASS but AI Audit (DeepSeek R1) returns FAIL:
+
+1. **Gemini mediates** — Analyzes both reviews and issues a ruling
+2. **User decides** — Telegram buttons for Accept/Uphold/Overturn
+3. **Rulings**: UPHOLD (re-implement), OVERTURN (proceed), REDESIGN (fail pipeline)
+4. **Timeout** — Auto-accepts Gemini's ruling after 5 minutes
+
+### Zero-Defect Shield
+
+- **Local CI Check** — Auto-detect and run build/lint/test commands
+- **AI Audit** — DeepSeek R1 adversarial audit with strict "Why" comment policy
+- **Test-Gate** — CI failures trigger Sonnet auto-fix loop
+- **Checkpoint & Resume** — `/retry` resumes from last successful step
 
 ### Init Pipeline (`/init`)
-
-A 5-step pipeline that bootstraps a new project end-to-end using only Claude CLI models (no Ollama required):
 
 ```
 /init [--public|--private] my-app A KMP mobile app for task management
@@ -73,83 +123,35 @@ A 5-step pipeline that bootstraps a new project end-to-end using only Claude CLI
 Step 0: [Haiku]   Stack Scout — tech stack + latest versions
 Step 1: [Opus]    Architecting — CLAUDE.md + agents.md generation
 Step 2: [Sonnet]  Execution — directory/file creation, git init, gh repo create
-Step 3: [Sonnet]  CI Watch — wait for CI, auto-fix failures (up to N retries)
+Step 3: [Sonnet]  CI Watch — wait for CI, auto-fix failures
 Step 4: [Opus]    Issue Planning — 5-10 GitHub issues auto-created
 ```
 
-| Step | Model | Role | Fatal? |
-|------|-------|------|--------|
-| 0 | **Haiku** (Claude CLI) | Tech stack research + version discovery | Fatal |
-| 1 | **Opus** (Claude CLI) | Generate CLAUDE.md + agents.md | Fatal |
-| 2 | **Sonnet** (Claude CLI) | Scaffold project, git init, push to GitHub | Fatal |
-| 3 | **Sonnet** (Claude CLI) | Wait for CI, auto-fix on failure (max 2 retries) | Non-fatal on timeout |
-| 4 | **Opus** (Claude CLI) | Plan and create 5-10 GitHub issues | Fatal |
-
-Key features:
-- **Reference CLAUDE.md** — Reuses existing project's coding standards as a template
-- **Minimal Buildable Skeleton** — Creates stack-appropriate project structure (not just config files)
-- **Auto CI** — `.github/workflows/ci.yml` included based on detected build commands
-- **CI Auto-Fix** — If CI fails, Sonnet reads the failure log and pushes a fix automatically
-- **ai-managed label** — All generated issues tagged for easy filtering
-- **Instant `/solve`** — Project is registered in `projects.json` and ready for issue solving immediately
-
-### Five-brid Pipeline (`PIPELINE_MODE=fivebrid`)
-
-A 9-step pipeline using **5 models** (Haiku, Opus, Gemini, Sonnet, DeepSeek/Qwen) for maximum quality:
+### Five-brid Pipeline Steps
 
 | Step | Model | Role | Fatal? |
 |------|-------|------|--------|
 | 0 | **Haiku** (Claude CLI) | Issue research + code pattern exploration | Fatal |
-| 1 | **Opus** (Claude CLI) | Detailed design document | Fatal |
-| 2 | **Gemini** (Gemini CLI) | Design critique — loops with Opus (max N retries) | Non-fatal |
+| 1 | **Opus** (Claude CLI) | Detailed design document + state context | Fatal |
+| 2 | **Gemini** (Gemini CLI) | Design critique — loops with Opus | Non-fatal |
 | 3 | **Qwen** (Ollama) | Code implementation hints | Non-fatal |
 | 4 | **Sonnet** (Claude CLI) | Full implementation | Fatal |
-| 5 | **Sonnet** (Claude CLI) | Self-review + fix (safe-fail with snapshot recovery) | Safe-fail |
-| 6 | **Gemini** (Gemini CLI) | Cross-review from different perspective | Non-fatal |
-| 7 | **DeepSeek** (Ollama) | Final security/logic audit (APPROVED/REJECTED) | Fatal |
-| 8 | **Qwen** (Ollama) | Enhanced training data extraction (conditional) | Non-fatal |
+| 5 | **Sonnet** (Claude CLI) | Self-review (safe-fail with snapshot) | Safe-fail |
+| 6 | **Gemini** (Gemini CLI) | Cross-review | Non-fatal |
+| 7 | **DeepSeek** (Ollama) | Adversarial audit (strict Why policy) | Fatal |
+| 7.5 | **Gemini** (Gemini CLI) | Supreme Court (on Self-Review/Audit conflict) | Conditional |
+| 8 | **Qwen** (Ollama) | Training data extraction | Non-fatal |
 
-Key features:
-- **Design Loop** — Opus and Gemini iterate on the design up to `MAX_DESIGN_RETRIES` times
-- **Safe-fail Self-Review** — Step 4 snapshot is saved; if Step 5 breaks the code, it auto-recovers
-- **Enhanced Data Mining** — Bundles research background + design intent + final code as JSONL training data
-- **No API costs for Claude** — Haiku/Opus/Sonnet all run via `claude -p --model` CLI
+### State Sync (`project_summary.json`)
 
-### Legacy Triple-Model Pipeline (`PIPELINE_MODE=legacy`)
-
-The original 5-step pipeline with DeepSeek R1, Qwen2.5-Coder, and Claude:
-
-1. **DeepSeek Design** (Ollama) — Implementation plan
-2. **Qwen Pre-Implement** (Ollama) — Code hints (non-fatal)
-3. **Claude Implement** (CLI) — Full implementation with auto-retry on review failure
-4. **Claude Review** (API/CLI) — Code review with PASS/FAIL verdict
-5. **DeepSeek Audit** (Ollama) — Final APPROVED/REJECTED verdict
-6. **Data Mining** (Ollama, conditional) — JSONL training data generation
-
-### Pipeline Mode Selection
-
-Set `PIPELINE_MODE` in `.env`:
-
-| Mode | Value | Description |
-|------|-------|-------------|
-| Five-brid | `fivebrid` | 9-step, 5 models (recommended) |
-| Legacy | `legacy` | 5-step, 3 models (default) |
-| Direct | `legacy` + `DUAL_CHECK_ENABLED=false` | Claude-only, no review gates |
-
-### Training Data (`/extract`)
-
-Generate instruction-output JSONL pairs from any source file using Qwen2.5-Coder. Results under 4KB are sent inline; larger outputs are sent as downloadable `.jsonl` files.
-
-### PR Rebase (`/rebase`)
-
-Automatically rebases a PR branch onto `main`. When conflicts occur, Claude CLI resolves them — no manual intervention needed.
+After each successful solve, key architectural decisions are extracted and stored in `.claude/project_summary.json`. The last 5 issues' decisions are injected into Design and Implement prompts of subsequent solves, ensuring continuity across issues.
 
 ## Tech Stack
 
 - **Python 3.11+** with full `asyncio` concurrency
 - **python-telegram-bot** — Telegram Bot API framework
 - **Claude CLI** — Haiku/Opus/Sonnet via `claude -p --model`
-- **Gemini CLI** — Design critique and cross-review
+- **Gemini CLI** — Design critique, cross-review, and Supreme Court mediation
 - **Anthropic API** — Direct API calls for legacy code review
 - **Ollama** — Local LLM inference (DeepSeek R1, Qwen2.5-Coder-32B)
 - **psutil** — Cross-platform system monitoring
@@ -161,10 +163,10 @@ Automatically rebases a PR branch onto `main`. When conflicts occur, Claude CLI 
 ### Prerequisites
 - macOS with [Homebrew](https://brew.sh)
 - Python 3.11+, [uv](https://github.com/astral-sh/uv)
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed (required for `/init` and `/solve`)
-- [GitHub CLI](https://cli.github.com/) (`gh`) authenticated (required for `/init` and `/solve`)
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed
+- [GitHub CLI](https://cli.github.com/) (`gh`) authenticated
 - [Gemini CLI](https://github.com/google-gemini/gemini-cli) installed (for fivebrid mode)
-- [Ollama](https://ollama.ai) with DeepSeek R1 and Qwen2.5-Coder-32B models (for fivebrid/legacy mode)
+- [Ollama](https://ollama.ai) with DeepSeek R1 and Qwen2.5-Coder-32B models
 
 ### Install
 
@@ -182,8 +184,8 @@ cp .env.example .env
 #   TELEGRAM_BOT_TOKEN=...
 #   TELEGRAM_ALLOWED_USER_ID=...
 #   PIPELINE_MODE=fivebrid  (or legacy)
-#   GITHUB_USER=your-github-username  (for /init)
-#   PROJECTS_BASE_DIR=~/Desktop/dev   (for /init)
+#   GITHUB_USER=your-github-username
+#   PROJECTS_BASE_DIR=~/Desktop/dev
 
 cp orchestrator/projects.json.example orchestrator/projects.json
 # Edit projects.json with your project paths
@@ -195,7 +197,7 @@ cp orchestrator/projects.json.example orchestrator/projects.json
 # Direct
 uv run python -m orchestrator
 
-# Or as a macOS launchd service (see COMMANDS.md for details)
+# Or as a macOS launchd service
 ```
 
 ## Project Structure
@@ -205,8 +207,11 @@ orchestrator/
 ├── __main__.py          # Entrypoint
 ├── bot.py               # Telegram app factory & provider init
 ├── config.py            # Pydantic settings (.env)
-├── handlers.py          # Command handlers (/status, /cmd, /init, /solve, /rebase, ...)
+├── handlers.py          # Command handlers (/status, /cmd, /init, /solve, ...)
 ├── pipeline.py          # Init + Five-brid + legacy pipelines
+├── scheduler.py         # Staggered parallel scheduler + dependency triage
+├── state_sync.py        # Project summary persistence (decisions across issues)
+├── checkpoint.py        # Pipeline checkpoint + resume (/retry)
 ├── security.py          # Auth filter & secret masking
 ├── system_monitor.py    # CPU, RAM, Disk, Thermal via psutil
 ├── tmux_manager.py      # tmux session capture

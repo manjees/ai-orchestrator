@@ -649,10 +649,10 @@ async def issues_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ── /solve ───────────────────────────────────────────────────────────────────
 
 async def solve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start solving issues: /solve <project> <issue#> [issue#] ... [--fast|--std|--full]"""
+    """Start solving issues: /solve <project> <issue#> [issue#] ... [--fast|--std|--full] [--parallel]"""
     try:
         if not context.args or len(context.args) < 2:
-            await _safe_reply(update, "Usage: <code>/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full]</code>")
+            await _safe_reply(update, "Usage: <code>/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full] [--parallel]</code>")
             return
 
         args = list(context.args)
@@ -665,8 +665,16 @@ async def solve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 solve_mode = mode
                 break
 
+        # Parse parallel flag
+        parallel_mode = False
+        for flag in ["--parallel", "-p"]:
+            if flag in args:
+                args.remove(flag)
+                parallel_mode = True
+                break
+
         if len(args) < 2:
-            await _safe_reply(update, "Usage: <code>/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full]</code>")
+            await _safe_reply(update, "Usage: <code>/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full] [--parallel]</code>")
             return
 
         project_name, err = _resolve_project(args[0], context.bot_data.get("projects", {}))
@@ -685,7 +693,8 @@ async def solve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 return
 
         chat_id = update.effective_chat.id  # type: ignore[union-attr]
-        await _start_solve(update, context, chat_id, project_name, issue_nums, solve_mode=solve_mode)
+        await _start_solve(update, context, chat_id, project_name, issue_nums,
+                          solve_mode=solve_mode, parallel_mode=parallel_mode)
     except Exception:
         logger.exception("/solve handler error")
         await _safe_reply(update, "Error starting solve.")
@@ -794,6 +803,7 @@ async def _start_solve(
     *,
     from_callback: bool = False,
     solve_mode: str | None = None,
+    parallel_mode: bool = False,
 ) -> None:
     """Guard duplicate issues and launch the solve loop."""
     # Block only if the same issue is already running
@@ -818,17 +828,27 @@ async def _start_solve(
     settings = context.bot_data["settings"]
     timeout = settings.solve_timeout
 
-    # Run in background so the handler returns immediately
-    asyncio.create_task(
-        _solve_issues(context, chat_id, project_name, project_path, issue_nums, timeout, cancel_events,
-                      solve_mode=solve_mode)
-    )
+    # Choose execution mode
+    if parallel_mode and len(issue_nums) > 1:
+        asyncio.create_task(
+            _solve_issues_staggered(
+                context, chat_id, project_name, project_path,
+                issue_nums, timeout, cancel_events,
+                solve_mode=solve_mode, settings=settings,
+            )
+        )
+    else:
+        asyncio.create_task(
+            _solve_issues(context, chat_id, project_name, project_path, issue_nums, timeout, cancel_events,
+                          solve_mode=solve_mode)
+        )
 
     mode_hint = f" [{solve_mode}]" if solve_mode else ""
+    parallel_hint = " [staggered]" if parallel_mode and len(issue_nums) > 1 else ""
     nums_str = ", ".join(f"#{n}" for n in issue_nums)
     await context.bot.send_message(
         chat_id,
-        f"Starting solve for <b>{html.escape(project_name)}</b> issues: {nums_str}{mode_hint}",
+        f"Starting solve for <b>{html.escape(project_name)}</b> issues: {nums_str}{mode_hint}{parallel_hint}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -912,6 +932,215 @@ async def _solve_issues(
     await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+# ── Staggered Parallel Solve ────────────────────────────────────────────
+
+_court_approvals: dict[str, dict] = {}
+_court_events: dict[str, asyncio.Event] = {}
+
+
+async def _solve_issues_staggered(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    project_name: str,
+    project_path: str,
+    issue_nums: list[int],
+    timeout: int,
+    cancel_events: dict[int, asyncio.Event],
+    *,
+    solve_mode: str | None = None,
+    settings=None,
+) -> None:
+    """Staggered parallel solve with dependency awareness."""
+    from .scheduler import StaggeredScheduler, triage_issue_dependencies
+    from .pipeline import step_fetch_issue, PipelineContext
+
+    _solve_active[chat_id] = _solve_active.get(chat_id, 0)  # already incremented in _start_solve
+    results: list[tuple[int, str, str]] = []
+
+    try:
+        # Ensure main repo is on 'main'
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", "main",
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=10)
+
+        # 1. Fetch all issues
+        issues_data = []
+        for num in issue_nums:
+            ctx = PipelineContext(
+                project_path=project_path,
+                project_name=project_name,
+                issue_num=num,
+                branch_name=f"solve/issue-{num}",
+            )
+            try:
+                await step_fetch_issue(ctx)
+                issues_data.append({"num": num, "title": ctx.issue_title, "body": ctx.issue_body})
+            except Exception:
+                issues_data.append({"num": num, "title": f"Issue #{num}", "body": ""})
+
+        # 2. Dependency-aware triage
+        async def _progress(msg):
+            pass
+        slots = await triage_issue_dependencies(issues_data, settings, _progress)
+
+        # 3. Build scheduler + detect file conflicts
+        scheduler = StaggeredScheduler()
+        for num in issue_nums:
+            slot = slots.get(num)
+            if slot:
+                scheduler.add_slot(slot)
+
+        scheduler.enforce_file_conflict_deps()
+
+        # 4. Report dependencies to user
+        dep_lines = []
+        for num in issue_nums:
+            slot = scheduler.get_slot(num)
+            if slot and slot.depends_on:
+                dep_lines.append(f"  #{num} depends on {', '.join(f'#{d}' for d in slot.depends_on)}")
+            else:
+                dep_lines.append(f"  #{num} independent")
+        dep_report = "\n".join(dep_lines)
+        await context.bot.send_message(
+            chat_id,
+            f"<b>Staggered Solve</b>\n<pre>{html.escape(dep_report)}</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+
+        # 5. Launch all issues concurrently (gates handle ordering)
+        async def _solve_with_scheduler(num):
+            if not await scheduler.wait_dependencies(num, timeout=settings.stagger_gate_timeout):
+                return num, "failed", "Dependency wait timed out or dependency failed"
+
+            async def _supreme_court_cb(ctx, ruling):
+                return await _supreme_court_user_decision(
+                    context, chat_id, ctx, ruling, settings,
+                )
+
+            status, detail = await _solve_single_issue(
+                context, chat_id, project_name, project_path,
+                num, timeout, cancel_events[num],
+                solve_mode=solve_mode or (scheduler.get_slot(num).mode if scheduler.get_slot(num) else None),
+                scheduler=scheduler,
+                supreme_court_cb=_supreme_court_cb,
+            )
+            return num, status, detail
+
+        tasks = [_solve_with_scheduler(num) for num in issue_nums]
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for r in outcomes:
+            if isinstance(r, Exception):
+                results.append((0, "failed", str(r)[:100]))
+            else:
+                results.append(r)
+
+    except Exception:
+        logger.exception("Staggered solve error")
+    finally:
+        count = _solve_active.get(chat_id, 1) - 1
+        if count <= 0:
+            _solve_active.pop(chat_id, None)
+        else:
+            _solve_active[chat_id] = count
+        events = _solve_cancels.get(chat_id, {})
+        for num in issue_nums:
+            events.pop(num, None)
+        if not events:
+            _solve_cancels.pop(chat_id, None)
+
+    # Summary
+    lines = [f"<b>Staggered Solve — {html.escape(project_name)}</b>"]
+    for num, status, detail in results:
+        icon = {"success": "✅", "failed": "❌", "skipped": "⏭"}.get(status, "❓")
+        lines.append(f"  {icon} #{num}: {html.escape(detail[:100])}")
+    await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def _supreme_court_user_decision(
+    context, chat_id, ctx, ruling, settings,
+) -> str:
+    """Show Supreme Court ruling to user and wait for decision."""
+    key = f"{chat_id}:{ctx.issue_num}"
+    _court_approvals[key] = {"decision": None}
+    event = asyncio.Event()
+    _court_events[key] = event
+
+    ruling_emoji = {"UPHOLD": "⚖️", "OVERTURN": "🔄", "REDESIGN": "🏗️"}.get(ruling, "⚖️")
+
+    report = (
+        f"<b>Supreme Court — #{ctx.issue_num}</b>\n\n"
+        f"Self-Review: PASS | AI Audit: FAIL\n"
+        f"Gemini Ruling: {ruling_emoji} <b>{ruling}</b>\n\n"
+        f"<pre>{html.escape(ctx.supreme_court_ruling[:500])}</pre>"
+    )
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"Accept ({ruling})",
+            callback_data=f"court_accept:{key}",
+        )],
+        [InlineKeyboardButton(
+            "Uphold (Re-implement)",
+            callback_data=f"court_uphold:{key}",
+        )],
+        [InlineKeyboardButton(
+            "Overturn (Proceed)",
+            callback_data=f"court_overturn:{key}",
+        )],
+    ])
+    await context.bot.send_message(chat_id, report, parse_mode=ParseMode.HTML, reply_markup=buttons)
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=settings.supreme_court_user_timeout)
+        decision = _court_approvals.get(key, {}).get("decision", ruling.lower())
+    except asyncio.TimeoutError:
+        decision = ruling.lower()
+    finally:
+        _court_approvals.pop(key, None)
+        _court_events.pop(key, None)
+
+    return decision
+
+
+async def supreme_court_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Supreme Court decision buttons."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    try:
+        data = query.data or ""
+        parts = data.split(":", 1)
+        action = parts[0]
+        key = parts[1] if len(parts) > 1 else ""
+
+        approval = _court_approvals.get(key)
+        if not approval:
+            await query.edit_message_text("Court session expired.")
+            return
+
+        if action == "court_accept":
+            approval["decision"] = None  # Will default to ruling
+        elif action == "court_uphold":
+            approval["decision"] = "uphold"
+        elif action == "court_overturn":
+            approval["decision"] = "overturn"
+
+        event = _court_events.get(key)
+        if event:
+            event.set()
+
+        await query.edit_message_text(f"Decision: {action.split('_')[1].upper()}")
+    except Exception:
+        logger.exception("Supreme Court callback error")
+
+
 async def _solve_single_issue(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -922,6 +1151,8 @@ async def _solve_single_issue(
     cancel_event: asyncio.Event,
     *,
     solve_mode: str | None = None,
+    scheduler=None,
+    supreme_court_cb=None,
 ) -> tuple[str, str]:
     """Solve one issue. Routes to fivebrid, dual-check, or direct-claude based on settings."""
     settings = context.bot_data["settings"]
@@ -941,6 +1172,8 @@ async def _solve_single_issue(
             ollama, gemini, settings,
             project_info=project_info,
             solve_mode=solve_mode,
+            scheduler=scheduler,
+            supreme_court_cb=supreme_court_cb,
         )
     elif settings.dual_check_enabled:
         ollama = context.bot_data.get("ollama")
@@ -1123,6 +1356,8 @@ async def _solve_with_fivebrid(
     settings,
     project_info: dict | None = None,
     solve_mode: str | None = None,
+    scheduler=None,
+    supreme_court_cb=None,
 ) -> tuple[str, str]:
     """Solve via adaptive Five-brid pipeline."""
     branch_name = f"solve/issue-{issue_num}"
@@ -1291,6 +1526,8 @@ async def _solve_with_fivebrid(
         status, detail = await run_fivebrid_pipeline(
             ctx, ollama, gemini, settings, cancel_event, progress_cb,
             project_info=project_info,
+            scheduler=scheduler,
+            supreme_court_cb=supreme_court_cb,
         )
 
         elapsed = int(time.monotonic() - pipeline_start)
@@ -1347,6 +1584,17 @@ async def _solve_with_fivebrid(
                             logger.warning("Failed to create sub-issue: %s", sub["title"])
 
                     if created_nums:
+                        # Register sub-issues in scheduler if available
+                        if scheduler:
+                            from .scheduler import IssueSlot
+                            for sub_num in created_nums:
+                                sub_slot = IssueSlot(
+                                    issue_num=sub_num,
+                                    depends_on=[issue_num],
+                                    mode=resolved_mode,
+                                )
+                                scheduler.add_slot(sub_slot)
+
                         await progress_cb(f"Sub-issues created: {created_nums}. Starting sequential solve...")
                         for i, sub_num in enumerate(created_nums):
                             if i > 0:
@@ -3154,7 +3402,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/init [--public] &lt;name&gt; &lt;desc&gt; — Bootstrap a new project\n"
         "/plan &lt;project&gt; — Plan new development issues\n"
         "/issues &lt;project&gt; — Open GitHub issues (with Solve buttons)\n"
-        "/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full] — Auto-solve issues\n"
+        "/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full] [--parallel] — Auto-solve issues\n"
         "/retry [project] [#] — Resume failed solve from checkpoint\n"
         "/rebase &lt;project&gt; &lt;pr#&gt; — Rebase PR onto latest main\n"
         "/discuss &lt;project&gt; &lt;question&gt; — Technical consultation with Opus\n"

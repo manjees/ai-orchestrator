@@ -153,6 +153,9 @@ def restore_context(checkpoint: dict) -> PipelineContext:
         mode=ctx_data.get("mode", "standard"),
         triage_reason=ctx_data.get("triage_reason", ""),
         split_plan=ctx_data.get("split_plan", ""),
+        supreme_court_ruling=ctx_data.get("supreme_court_ruling", ""),
+        draft_context_diff=ctx_data.get("draft_context_diff", ""),
+        predecessor_issue_num=ctx_data.get("predecessor_issue_num", 0),
         steps=steps,
     )
     return ctx
