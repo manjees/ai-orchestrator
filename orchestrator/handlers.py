@@ -29,6 +29,7 @@ from .checkpoint import (
     restore_context,
     save_checkpoint,
 )
+from .config import PIPELINE_MODES
 from .pipeline import (
     InitContext,
     PipelineContext,
@@ -40,6 +41,7 @@ from .pipeline import (
     step_plan_issues,
     step_discuss_consult,
     step_discuss_to_issues,
+    step_triage_and_split,
 )
 from .security import mask_secrets
 from .system_monitor import get_system_status
@@ -65,6 +67,10 @@ _discuss_cancels: dict[int, asyncio.Event] = {}
 
 # Discuss results for [Create Issues] button: message_id → context dict
 _discuss_results: dict[int, dict] = {}
+
+# Strategy approval state for adaptive pipeline
+_strategy_approvals: dict[str, dict] = {}  # approval_key → context dict
+_strategy_events: dict[str, asyncio.Event] = {}  # approval_key → event
 
 # ANSI escape codes: CSI sequences (incl. ?/= private modes), OSC sequences, single ESC codes
 _ANSI_RE = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^[\]()]")
@@ -643,13 +649,27 @@ async def issues_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ── /solve ───────────────────────────────────────────────────────────────────
 
 async def solve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start solving issues: /solve <project> <issue#> [issue#] ..."""
+    """Start solving issues: /solve <project> <issue#> [issue#] ... [--fast|--std|--full]"""
     try:
         if not context.args or len(context.args) < 2:
-            await _safe_reply(update, "Usage: <code>/solve &lt;project&gt; &lt;issue#&gt; [issue#] ...</code>")
+            await _safe_reply(update, "Usage: <code>/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full]</code>")
             return
 
-        project_name, err = _resolve_project(context.args[0], context.bot_data.get("projects", {}))
+        args = list(context.args)
+
+        # Parse mode flag
+        solve_mode: str | None = None
+        for flag, mode in [("--fast", "express"), ("--std", "standard"), ("--full", "full")]:
+            if flag in args:
+                args.remove(flag)
+                solve_mode = mode
+                break
+
+        if len(args) < 2:
+            await _safe_reply(update, "Usage: <code>/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full]</code>")
+            return
+
+        project_name, err = _resolve_project(args[0], context.bot_data.get("projects", {}))
         if project_name is None:
             await _safe_reply(update, err)
             return
@@ -657,7 +677,7 @@ async def solve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         # Parse issue numbers
         issue_nums: list[int] = []
-        for arg in context.args[1:]:
+        for arg in args[1:]:
             try:
                 issue_nums.append(int(arg))
             except ValueError:
@@ -665,7 +685,7 @@ async def solve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 return
 
         chat_id = update.effective_chat.id  # type: ignore[union-attr]
-        await _start_solve(update, context, chat_id, project_name, issue_nums)
+        await _start_solve(update, context, chat_id, project_name, issue_nums, solve_mode=solve_mode)
     except Exception:
         logger.exception("/solve handler error")
         await _safe_reply(update, "Error starting solve.")
@@ -726,6 +746,45 @@ async def solve_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TY
         logger.exception("solve cancel callback error")
 
 
+async def strategy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Strategy Report approval buttons."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    try:
+        data = query.data or ""
+        # format: strategy_approve:<chat_id>:<issue_num>
+        #         strategy_nosplit:<chat_id>:<issue_num>
+        #         strategy_cancel:<chat_id>:<issue_num>
+        parts = data.split(":", 1)
+        action = parts[0]  # strategy_approve | strategy_nosplit | strategy_cancel
+        approval_key = parts[1] if len(parts) > 1 else ""
+
+        approval = _strategy_approvals.get(approval_key)
+        if not approval:
+            try:
+                await query.edit_message_text("Strategy session expired.")
+            except Exception:
+                pass
+            return
+
+        if action == "strategy_approve":
+            approval["decision"] = "approve"
+        elif action == "strategy_nosplit":
+            approval["decision"] = "nosplit"
+        else:
+            approval["decision"] = "cancel"
+
+        # Wake up the waiting coroutine
+        event = _strategy_events.get(approval_key)
+        if event:
+            event.set()
+    except Exception:
+        logger.exception("strategy callback error")
+
+
 async def _start_solve(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -734,6 +793,7 @@ async def _start_solve(
     issue_nums: list[int],
     *,
     from_callback: bool = False,
+    solve_mode: str | None = None,
 ) -> None:
     """Guard duplicate issues and launch the solve loop."""
     # Block only if the same issue is already running
@@ -760,13 +820,15 @@ async def _start_solve(
 
     # Run in background so the handler returns immediately
     asyncio.create_task(
-        _solve_issues(context, chat_id, project_name, project_path, issue_nums, timeout, cancel_events)
+        _solve_issues(context, chat_id, project_name, project_path, issue_nums, timeout, cancel_events,
+                      solve_mode=solve_mode)
     )
 
+    mode_hint = f" [{solve_mode}]" if solve_mode else ""
     nums_str = ", ".join(f"#{n}" for n in issue_nums)
     await context.bot.send_message(
         chat_id,
-        f"Starting solve for <b>{html.escape(project_name)}</b> issues: {nums_str}",
+        f"Starting solve for <b>{html.escape(project_name)}</b> issues: {nums_str}{mode_hint}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -779,6 +841,8 @@ async def _solve_issues(
     issue_nums: list[int],
     timeout: int,
     cancel_events: dict[int, asyncio.Event],
+    *,
+    solve_mode: str | None = None,
 ) -> None:
     """Solve issues in parallel using git worktrees."""
     results: list[tuple[int, str, str]] = []  # (issue#, status, detail)
@@ -799,6 +863,7 @@ async def _solve_issues(
             status, detail = await _solve_single_issue(
                 context, chat_id, project_name, project_path,
                 num, timeout, cancel_events[num],
+                solve_mode=solve_mode,
             )
             results.append((num, status, detail))
         else:
@@ -807,6 +872,7 @@ async def _solve_issues(
                 _solve_single_issue(
                     context, chat_id, project_name, project_path,
                     issue_num, timeout, cancel_events[issue_num],
+                    solve_mode=solve_mode,
                 )
                 for issue_num in issue_nums
             ]
@@ -854,6 +920,8 @@ async def _solve_single_issue(
     issue_num: int,
     timeout: int,
     cancel_event: asyncio.Event,
+    *,
+    solve_mode: str | None = None,
 ) -> tuple[str, str]:
     """Solve one issue. Routes to fivebrid, dual-check, or direct-claude based on settings."""
     settings = context.bot_data["settings"]
@@ -872,6 +940,7 @@ async def _solve_single_issue(
             issue_num, timeout, cancel_event,
             ollama, gemini, settings,
             project_info=project_info,
+            solve_mode=solve_mode,
         )
     elif settings.dual_check_enabled:
         ollama = context.bot_data.get("ollama")
@@ -1053,8 +1122,9 @@ async def _solve_with_fivebrid(
     gemini: GeminiCLIProvider,
     settings,
     project_info: dict | None = None,
+    solve_mode: str | None = None,
 ) -> tuple[str, str]:
-    """Solve via Five-brid pipeline."""
+    """Solve via adaptive Five-brid pipeline."""
     branch_name = f"solve/issue-{issue_num}"
 
     cancel_btn = InlineKeyboardMarkup([
@@ -1062,7 +1132,7 @@ async def _solve_with_fivebrid(
     ])
     msg = await context.bot.send_message(
         chat_id,
-        f"<b>#{issue_num}</b> [0/8] Preparing git worktree (Five-brid)...",
+        f"<b>#{issue_num}</b> Preparing git worktree...",
         parse_mode=ParseMode.HTML,
         reply_markup=cancel_btn,
     )
@@ -1070,6 +1140,9 @@ async def _solve_with_fivebrid(
     pipeline_start = time.monotonic()
 
     worktree_dir = ""
+    ctx: PipelineContext | None = None
+    triage_result: dict = {}
+    resolved_mode = "standard"
     try:
         # ── Git Worktree Setup ──
         git_ok, git_result = await _git_fresh_start(project_path, branch_name)
@@ -1118,6 +1191,102 @@ async def _solve_with_fivebrid(
             )
             await _edit_msg(msg, text, reply_markup=cancel_btn)
 
+        # ── Triage & Split ──
+        triage_result = await step_triage_and_split(ctx, settings, progress_cb)
+
+        # Mode resolution: flag > settings > auto-detect
+        if solve_mode:
+            resolved_mode = solve_mode
+        elif settings.solve_mode != "auto":
+            resolved_mode = settings.solve_mode
+        else:
+            resolved_mode = triage_result["mode"]
+
+        ctx.mode = resolved_mode
+        mode_config = PIPELINE_MODES[resolved_mode]
+        est_min, est_max = mode_config["estimated_minutes"]
+
+        # ── Strategy Report (auto mode + split proposed → approval required) ──
+        if not solve_mode and triage_result["split_needed"]:
+            sub_issues = triage_result["sub_issues"]
+            sub_list = "\n".join(
+                f"  {i+1}. {s['title']}" for i, s in enumerate(sub_issues)
+            )
+            files_line = ""
+            if triage_result.get("estimated_files"):
+                files_line = f"<b>Files:</b> {html.escape(triage_result['estimated_files'])}\n"
+            report = (
+                f"<b>Strategy Report — #{issue_num}</b>\n\n"
+                f"<b>Mode:</b> {mode_config['description']} ({mode_config['label']})\n"
+                f"<b>ETA:</b> {est_min}-{est_max} min\n"
+                f"<b>Reason:</b> {html.escape(triage_result['reason'])}\n"
+                f"{files_line}\n"
+                f"<b>Split Proposal ({len(sub_issues)} sub-issues):</b>\n"
+                f"<pre>{html.escape(sub_list)}</pre>"
+            )
+
+            approval_key = f"{chat_id}:{issue_num}"
+            _strategy_approvals[approval_key] = {
+                "triage_result": triage_result,
+                "decision": None,
+            }
+
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "Split & Execute",
+                    callback_data=f"strategy_approve:{approval_key}",
+                )],
+                [InlineKeyboardButton(
+                    "No Split (Full)",
+                    callback_data=f"strategy_nosplit:{approval_key}",
+                )],
+                [InlineKeyboardButton(
+                    "Cancel",
+                    callback_data=f"strategy_cancel:{approval_key}",
+                )],
+            ])
+            await _edit_msg(msg, report, reply_markup=buttons)
+
+            # Wait for approval
+            approval_event = asyncio.Event()
+            _strategy_events[approval_key] = approval_event
+            try:
+                await asyncio.wait_for(
+                    approval_event.wait(),
+                    timeout=settings.strategy_approval_timeout,
+                )
+                decision = _strategy_approvals.get(approval_key, {}).get("decision")
+            except asyncio.TimeoutError:
+                await _edit_msg(msg, f"<b>#{issue_num}</b> Strategy approval timed out.")
+                return "skipped", "Strategy approval timed out"
+            finally:
+                _strategy_approvals.pop(approval_key, None)
+                _strategy_events.pop(approval_key, None)
+
+            if decision == "cancel":
+                await _edit_msg(msg, f"<b>#{issue_num}</b> Cancelled by user.")
+                return "skipped", "Cancelled by user"
+            elif decision == "nosplit":
+                ctx.mode = "full"
+                ctx.split_plan = ""
+                resolved_mode = "full"
+                mode_config = PIPELINE_MODES["full"]
+                est_min, est_max = mode_config["estimated_minutes"]
+            # decision == "approve" → split_plan preserved
+        else:
+            # Flag specified or no split needed → execute immediately
+            files_hint = ""
+            if triage_result.get("estimated_files"):
+                files_hint = f"\nFiles: {triage_result['estimated_files']}"
+            await _edit_msg(
+                msg,
+                f"<b>#{issue_num}</b> [{mode_config['description']}] "
+                f"ETA: {est_min}-{est_max} min\n"
+                f"{html.escape(triage_result['reason'])}"
+                f"{html.escape(files_hint)}",
+                reply_markup=cancel_btn,
+            )
+
         # Run fivebrid pipeline
         status, detail = await run_fivebrid_pipeline(
             ctx, ollama, gemini, settings, cancel_event, progress_cb,
@@ -1153,6 +1322,60 @@ async def _solve_with_fivebrid(
                     f"{html.escape(intent_summary)}\n\n"
                     f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
                 )
+
+                # ── Sub-issue split execution ──
+                if ctx.split_plan and triage_result.get("sub_issues"):
+                    sub_issues = triage_result["sub_issues"]
+                    created_nums: list[int] = []
+                    for sub in sub_issues:
+                        try:
+                            proc = await asyncio.create_subprocess_exec(
+                                "gh", "issue", "create",
+                                "--title", sub["title"],
+                                "--body", f"(Auto-split from #{issue_num})\n\n{sub['body']}",
+                                "--repo", f"{settings.github_user}/{project_name}",
+                                cwd=project_path,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                            url = out.decode().strip()
+                            num_match = re.search(r"/(\d+)$", url)
+                            if num_match:
+                                created_nums.append(int(num_match.group(1)))
+                        except Exception:
+                            logger.warning("Failed to create sub-issue: %s", sub["title"])
+
+                    if created_nums:
+                        await progress_cb(f"Sub-issues created: {created_nums}. Starting sequential solve...")
+                        for i, sub_num in enumerate(created_nums):
+                            if i > 0:
+                                try:
+                                    fetch_proc = await asyncio.create_subprocess_exec(
+                                        "git", "fetch", "origin", "main",
+                                        cwd=project_path,
+                                        stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.PIPE,
+                                    )
+                                    await asyncio.wait_for(fetch_proc.communicate(), timeout=30)
+                                except Exception:
+                                    pass
+                            sub_cancel = asyncio.Event()
+                            _solve_cancels.setdefault(chat_id, {})[sub_num] = sub_cancel
+                            sub_status, sub_detail = await _solve_single_issue(
+                                context, chat_id, project_name, project_path,
+                                sub_num, timeout, sub_cancel,
+                                solve_mode=resolved_mode,
+                            )
+                            _solve_cancels.get(chat_id, {}).pop(sub_num, None)
+                            if sub_status != "success":
+                                await context.bot.send_message(
+                                    chat_id,
+                                    f"Sub-issue #{sub_num} failed ({sub_detail[:100]}). "
+                                    f"Remaining sub-issues skipped.",
+                                )
+                                break
+
                 return "success", f"PR created: {pr_url}"
             else:
                 await _edit_msg(
@@ -1167,7 +1390,7 @@ async def _solve_with_fivebrid(
             # Failed — add retry hint if checkpoint is possible
             retry_hint = ""
             if ctx and ctx.impl_snapshot_ref:
-                retry_hint = f"\n\n💡 <code>/retry {html.escape(project_name)} {issue_num}</code>"
+                retry_hint = f"\n\n<code>/retry {html.escape(project_name)} {issue_num}</code>"
             intent_summary = format_intent_summary(ctx)
             step_summary = format_pipeline_summary(ctx)
             await _edit_msg(
@@ -1186,7 +1409,8 @@ async def _solve_with_fivebrid(
         return "failed", str(exc)[:100]
     finally:
         if worktree_dir:
-            await _save_checkpoint_on_failure(ctx, worktree_dir, project_name, issue_num, "fivebrid")
+            if ctx is not None:
+                await _save_checkpoint_on_failure(ctx, worktree_dir, project_name, issue_num, "fivebrid")
             await _cleanup_worktree(project_path, worktree_dir, branch_name)
 
 
@@ -2930,7 +3154,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/init [--public] &lt;name&gt; &lt;desc&gt; — Bootstrap a new project\n"
         "/plan &lt;project&gt; — Plan new development issues\n"
         "/issues &lt;project&gt; — Open GitHub issues (with Solve buttons)\n"
-        "/solve &lt;project&gt; &lt;#&gt; [#...] — Auto-solve issues via Claude\n"
+        "/solve &lt;project&gt; &lt;#&gt; [#...] [--fast|--std|--full] — Auto-solve issues\n"
         "/retry [project] [#] — Resume failed solve from checkpoint\n"
         "/rebase &lt;project&gt; &lt;pr#&gt; — Rebase PR onto latest main\n"
         "/discuss &lt;project&gt; &lt;question&gt; — Technical consultation with Opus\n"

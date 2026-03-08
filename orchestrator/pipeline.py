@@ -22,7 +22,7 @@ from .ai.base import AIResponse, Message, Role
 from .ai.anthropic_provider import AnthropicProvider
 from .ai.gemini_provider import GeminiCLIProvider
 from .ai.ollama_provider import OllamaProvider
-from .config import Settings
+from .config import PIPELINE_MODES, Settings
 from .security import mask_secrets
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,10 @@ class PipelineContext:
     ai_audit_passed: bool = False
     ci_fix_history: list[str] = field(default_factory=list)
     audit_fix_history: list[str] = field(default_factory=list)
+    # Adaptive pipeline fields
+    mode: str = "standard"  # "express" | "standard" | "full"
+    triage_reason: str = ""  # Haiku triage reasoning
+    split_plan: str = ""     # Opus split proposal (empty if not needed)
     steps: list[PipelineStep] = field(default_factory=list)
 
 
@@ -251,18 +255,184 @@ def _extract_test_failures(log: str, max_chars: int = 500) -> str:
     return result
 
 
+# ── Adaptive Pipeline Step Builder ──────────────────────────────────────────
+
+def build_fivebrid_steps(mode: str, ci_commands: list[str]) -> list[PipelineStep]:
+    """Build pipeline step list based on adaptive mode."""
+    mode_config = PIPELINE_MODES.get(mode, PIPELINE_MODES["standard"])
+    allowed = mode_config["steps"]  # None = all
+
+    all_steps = [
+        "Haiku Research",
+        "Opus Design",
+        "Gemini Design Critique",
+        "Qwen Hints",
+        "Sonnet Implement",
+    ]
+    if ci_commands:
+        all_steps.append("Local CI Check")
+    all_steps += [
+        "Sonnet Self-Review",
+        "Gemini Cross-Review",
+        "AI Audit",
+    ]
+
+    if allowed is None:
+        return [PipelineStep(name=n) for n in all_steps]
+
+    return [
+        PipelineStep(name=n) for n in all_steps
+        if n in allowed and (n != "Local CI Check" or ci_commands)
+    ]
+
+
+# ── Triage & Split Detection ───────────────────────────────────────────────
+
+async def step_triage_and_split(
+    ctx: PipelineContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+) -> dict:
+    """Triage issue complexity and detect if splitting is needed.
+
+    Returns dict with:
+        mode: "express" | "standard" | "full"
+        reason: str (Haiku's reasoning)
+        estimated_files: str
+        split_needed: bool
+        split_plan: str (Opus's sub-issue proposal, empty if not needed)
+        sub_issues: list[dict] (parsed sub-issues: [{title, body}])
+    """
+    # ── Phase 1: Fetch issue ──
+    if not ctx.issue_body:
+        await progress_cb("Fetching issue...")
+        await step_fetch_issue(ctx)
+
+    # ── Phase 2: Haiku Triage ──
+    await progress_cb("Analyzing complexity (Haiku)...")
+    triage_prompt = (
+        "Analyze this GitHub issue and classify its implementation complexity.\n\n"
+        f"Title: {ctx.issue_title}\n"
+        f"Body:\n{ctx.issue_body[:3000]}\n\n"
+        "Rules:\n"
+        "- EXPRESS: Typo fix, config change, dependency bump, simple rename, "
+        "one-line fix, README update, version bump\n"
+        "- STANDARD: New feature, bug fix requiring investigation, refactoring, "
+        "API change, test additions\n"
+        "- FULL: Architecture change, security-critical fix, multi-system integration, "
+        "breaking change, performance optimization requiring multiple files\n\n"
+        "IMPORTANT: If in doubt between EXPRESS and STANDARD, choose STANDARD.\n"
+        "Domain-specific logic (matching algorithms, scoring, business rules) is always STANDARD+.\n\n"
+        "Reply in this EXACT format:\n"
+        "MODE: EXPRESS|STANDARD|FULL\n"
+        "REASON: <one sentence why>\n"
+        "FILES: <comma-separated list of likely files to modify>"
+    )
+    try:
+        triage_output = await _call_claude_cli_with_progress(
+            triage_prompt,
+            model=settings.haiku_model,
+            timeout=settings.triage_timeout,
+            progress_cb=progress_cb,
+            step_name="Triage",
+        )
+        mode = "standard"
+        reason = ""
+        estimated_files = ""
+        for line in triage_output.strip().splitlines():
+            if line.startswith("MODE:"):
+                val = line.split(":", 1)[1].strip().upper()
+                if "EXPRESS" in val:
+                    mode = "express"
+                elif "FULL" in val:
+                    mode = "full"
+            elif line.startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+            elif line.startswith("FILES:"):
+                estimated_files = line.split(":", 1)[1].strip()
+    except Exception:
+        mode, reason, estimated_files = "standard", "Triage failed, defaulting to standard", ""
+
+    ctx.triage_reason = reason
+
+    # ── Phase 3: Opus Split Detection (standard/full only) ──
+    split_needed = False
+    split_plan = ""
+    sub_issues: list[dict] = []
+
+    if mode != "express":
+        await progress_cb("Checking if issue should be split (Opus)...")
+        split_prompt = (
+            "You are an expert software architect. Analyze this GitHub issue "
+            "and determine if it should be split into smaller, independently "
+            "solvable sub-issues.\n\n"
+            f"Title: {ctx.issue_title}\n"
+            f"Body:\n{ctx.issue_body[:4000]}\n\n"
+            "Rules:\n"
+            "- Only split if the issue clearly contains 2+ independent tasks\n"
+            "- Each sub-issue must be independently implementable and testable\n"
+            "- Do NOT split if the tasks are tightly coupled\n"
+            "- Max 5 sub-issues\n\n"
+            "If splitting is NOT needed, reply: SPLIT: NO\n\n"
+            "If splitting IS needed, reply in this format:\n"
+            "SPLIT: YES\n"
+            "---\n"
+            "TITLE: <sub-issue 1 title>\n"
+            "BODY: <sub-issue 1 description>\n"
+            "---\n"
+            "TITLE: <sub-issue 2 title>\n"
+            "BODY: <sub-issue 2 description>\n"
+            "---"
+        )
+        try:
+            split_output = await _call_claude_cli_with_progress(
+                split_prompt,
+                model=settings.opus_model,
+                timeout=settings.split_timeout,
+                progress_cb=progress_cb,
+                step_name="Split Analysis",
+            )
+            if "SPLIT: YES" in split_output.upper():
+                split_needed = True
+                split_plan = split_output
+                # Parse sub-issues
+                blocks = split_output.split("---")
+                for block in blocks:
+                    title_match = re.search(r"TITLE:\s*(.+)", block)
+                    body_match = re.search(r"BODY:\s*(.+)", block, re.DOTALL)
+                    if title_match and body_match:
+                        sub_issues.append({
+                            "title": title_match.group(1).strip(),
+                            "body": body_match.group(1).strip(),
+                        })
+        except Exception:
+            logger.warning("Split analysis failed, proceeding without split")
+
+    ctx.split_plan = split_plan
+
+    return {
+        "mode": mode,
+        "reason": reason,
+        "estimated_files": estimated_files,
+        "split_needed": split_needed,
+        "split_plan": split_plan,
+        "sub_issues": sub_issues,
+    }
+
+
 async def step_local_ci_check(
     ctx: PipelineContext,
     settings: Settings,
     progress_cb: ProgressCallback,
     ci_commands: list[str],
     step_index: int,
+    max_retries_override: int | None = None,
 ) -> None:
     """Run local CI commands and auto-fix with Sonnet on failure."""
     step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
-    max_retries = settings.local_ci_fix_retries
+    max_retries = max_retries_override if max_retries_override is not None else settings.local_ci_fix_retries
 
     try:
         for attempt in range(max_retries + 1):
@@ -1512,38 +1682,35 @@ async def run_fivebrid_pipeline(
     project_info: dict | None = None,
     resume_from_step: int = -1,
 ) -> tuple[str, str]:
-    """Run the 9-step Five-brid pipeline (10 with Local CI Check). Returns (status, detail)."""
+    """Run the adaptive Five-brid pipeline. Returns (status, detail)."""
 
     # Resolve CI commands once at start
     ci_commands = _resolve_ci_commands(ctx.project_path, project_info) if settings.local_ci_enabled else []
 
-    # Initialize fivebrid steps
+    # Initialize steps based on adaptive mode
     if not ctx.steps:
-        steps = [
-            PipelineStep(name="Haiku Research"),        # 0
-            PipelineStep(name="Opus Design"),           # 1
-            PipelineStep(name="Gemini Design Critique"),# 2
-            PipelineStep(name="Qwen Hints"),            # 3
-            PipelineStep(name="Sonnet Implement"),      # 4
-        ]
-        if ci_commands:
-            steps.append(PipelineStep(name="Local CI Check"))  # 5
-        steps += [
-            PipelineStep(name="Sonnet Self-Review"),    # 5 or 6
-            PipelineStep(name="Gemini Cross-Review"),   # 6 or 7
-            PipelineStep(name="AI Audit"),               # 7 or 8
-        ]
-        ctx.steps = steps
+        ctx.steps = build_fivebrid_steps(ctx.mode, ci_commands)
+
+    # Mode-specific config overrides
+    mode_config = PIPELINE_MODES.get(ctx.mode, PIPELINE_MODES["standard"])
+    effective_max_design_retries = mode_config["max_design_retries"]
+    effective_ai_audit_max_retries = mode_config["ai_audit_max_retries"]
+    effective_ai_audit_enabled = mode_config["ai_audit_enabled"]
+    effective_ci_fix_retries = mode_config["local_ci_fix_retries"]
 
     resuming = resume_from_step >= 0
 
     def _step_done(idx: int) -> bool:
         return _is_step_done(ctx, idx, resuming)
 
+    def _find_step(name: str) -> int | None:
+        return next((i for i, s in enumerate(ctx.steps) if s.name == name), None)
+
     try:
-        # Fetch issue
-        if resuming and ctx.issue_body:
-            await progress_cb("Issue data restored from checkpoint")
+        # Fetch issue (skip if already populated by triage or checkpoint)
+        if ctx.issue_body:
+            if resuming:
+                await progress_cb("Issue data restored from checkpoint")
         else:
             await progress_cb("Fetching issue...")
             await step_fetch_issue(ctx)
@@ -1554,89 +1721,99 @@ async def run_fivebrid_pipeline(
             return "skipped", "Cancelled by user"
 
         # ── Phase 0: Research ──
-        if _step_done(0):
-            await progress_cb(f"[0/{total_steps}] Haiku Research (cached)")
-        else:
-            await progress_cb(f"[0/{total_steps}] Haiku Research...")
-            await step_haiku_research(ctx, settings, progress_cb, step_index=0)
+        research_idx = _find_step("Haiku Research")
+        if research_idx is not None:
+            if _step_done(research_idx):
+                await progress_cb(f"[{research_idx}/{total_steps}] Haiku Research (cached)")
+            else:
+                await progress_cb(f"[{research_idx}/{total_steps}] Haiku Research...")
+                await step_haiku_research(ctx, settings, progress_cb, step_index=research_idx)
 
-        if cancel_event.is_set():
-            return "skipped", "Cancelled by user"
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
 
         # ── Phase A: Design Loop ──
-        if not resuming or not _step_done(1):
-            for iteration in range(settings.max_design_retries + 1):
-                ctx.design_iteration = iteration
+        design_idx = _find_step("Opus Design")
+        if design_idx is not None:
+            if not resuming or not _step_done(design_idx):
+                for iteration in range(effective_max_design_retries + 1):
+                    ctx.design_iteration = iteration
 
-                if cancel_event.is_set():
-                    return "skipped", "Cancelled by user"
+                    if cancel_event.is_set():
+                        return "skipped", "Cancelled by user"
 
-                # Step 1: Opus Design
-                step_label = f" (iteration {iteration + 1})" if iteration > 0 else ""
-                await progress_cb(f"[1/{total_steps}] Opus Design{step_label}...")
+                    # Step: Opus Design
+                    step_label = f" (iteration {iteration + 1})" if iteration > 0 else ""
+                    await progress_cb(f"[{design_idx}/{total_steps}] Opus Design{step_label}...")
 
-                if iteration > 0:
-                    # Insert new design + critique step pairs after previous critique
-                    # Previous critique is at index 2 + (iteration-1)*2
-                    insert_at = 3 + (iteration - 1) * 2
-                    ctx.steps.insert(insert_at, PipelineStep(name=f"Opus Design (retry {iteration})"))
-                    ctx.steps.insert(insert_at + 1, PipelineStep(name=f"Gemini Critique (retry {iteration})"))
-                    total_steps = len(ctx.steps)
+                    if iteration > 0:
+                        critique_base = _find_step("Gemini Design Critique")
+                        if critique_base is not None:
+                            insert_at = critique_base + 1 + (iteration - 1) * 2
+                        else:
+                            insert_at = design_idx + 1 + (iteration - 1) * 2
+                        ctx.steps.insert(insert_at, PipelineStep(name=f"Opus Design (retry {iteration})"))
+                        ctx.steps.insert(insert_at + 1, PipelineStep(name=f"Gemini Critique (retry {iteration})"))
+                        total_steps = len(ctx.steps)
 
-                design_idx = 1 + (iteration * 2)
-                await step_opus_design(ctx, settings, progress_cb, step_index=design_idx)
+                    current_design_idx = design_idx + (iteration * 2)
+                    await step_opus_design(ctx, settings, progress_cb, step_index=current_design_idx)
 
-                if cancel_event.is_set():
-                    return "skipped", "Cancelled by user"
+                    if cancel_event.is_set():
+                        return "skipped", "Cancelled by user"
 
-                # Step 2: Gemini Design Critique (non-fatal)
-                critique_idx = design_idx + 1
-                await progress_cb(f"[2/{total_steps}] Gemini Design Critique{step_label}...")
-                await step_gemini_design_critique(
-                    ctx, gemini, settings, progress_cb, step_index=critique_idx,
-                )
-
-                critique_step = ctx.steps[critique_idx]
-                # Check if critique says NEEDS_REVISION and we have retries left
-                if critique_step.status == "failed" and "NEEDS_REVISION" in critique_step.detail:
-                    if iteration < settings.max_design_retries:
-                        await progress_cb(
-                            f"Design needs revision (iteration {iteration + 1}/{settings.max_design_retries + 1}), retrying..."
+                    # Gemini Design Critique
+                    critique_idx = _find_step("Gemini Design Critique")
+                    if critique_idx is not None:
+                        current_critique_idx = current_design_idx + 1
+                        await progress_cb(f"[{current_critique_idx}/{total_steps}] Gemini Design Critique{step_label}...")
+                        await step_gemini_design_critique(
+                            ctx, gemini, settings, progress_cb, step_index=current_critique_idx,
                         )
-                        continue
-                # APPROVED, skipped, or no more retries — proceed
-                break
-        else:
-            await progress_cb(f"[1/{total_steps}] Design phase (cached)")
 
-        if cancel_event.is_set():
-            return "skipped", "Cancelled by user"
+                        critique_step = ctx.steps[current_critique_idx]
+                        if critique_step.status == "failed" and "NEEDS_REVISION" in critique_step.detail:
+                            if iteration < effective_max_design_retries:
+                                await progress_cb(
+                                    f"Design needs revision (iteration {iteration + 1}/{effective_max_design_retries + 1}), retrying..."
+                                )
+                                continue
+                    break
+            else:
+                await progress_cb(f"[{design_idx}/{total_steps}] Design phase (cached)")
+
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
 
         # ── Phase B: Implementation ──
 
         # Find step indices dynamically (design loop may have added extra steps)
         total_steps = len(ctx.steps)
-        qwen_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Qwen Hints")
-        impl_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Implement")
 
-        # Step 3: Qwen Hints (non-fatal)
-        if _step_done(qwen_idx):
-            await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement (cached)")
-        else:
-            try:
-                await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement...")
-                await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=qwen_idx)
-            except Exception as exc:
-                logger.warning("Qwen pre-implement failed (non-fatal): %s", exc)
+        # Qwen Hints (non-fatal, optional)
+        qwen_idx = _find_step("Qwen Hints")
+        if qwen_idx is not None:
+            if _step_done(qwen_idx):
+                await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement (cached)")
+            else:
+                try:
+                    await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement...")
+                    await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=qwen_idx)
+                except Exception as exc:
+                    logger.warning("Qwen pre-implement failed (non-fatal): %s", exc)
 
-        if cancel_event.is_set():
-            return "skipped", "Cancelled by user"
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
 
-        # Step 4: Sonnet Implement (uses existing step_claude_implement)
+        # Sonnet Implement (always present)
+        impl_idx = _find_step("Sonnet Implement")
+        if impl_idx is None:
+            return "failed", "Sonnet Implement step not found"
+
         if _step_done(impl_idx):
-            await progress_cb(f"[4/{total_steps}] Sonnet Implement (cached)")
+            await progress_cb(f"[{impl_idx}/{total_steps}] Sonnet Implement (cached)")
         else:
-            await progress_cb(f"[4/{total_steps}] Sonnet Implement...")
+            await progress_cb(f"[{impl_idx}/{total_steps}] Sonnet Implement...")
             await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
 
         # Capture snapshot ref for safe-fail recovery
@@ -1653,93 +1830,97 @@ async def run_fivebrid_pipeline(
         if cancel_event.is_set():
             return "skipped", "Cancelled by user"
 
-        # Step 5 (optional): Local CI Check
-        if ci_commands:
-            ci_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Local CI Check")
+        # Local CI Check (optional)
+        ci_idx = _find_step("Local CI Check")
+        if ci_idx is not None and ci_commands:
             if _step_done(ci_idx):
-                await progress_cb(f"[5/{total_steps}] Local CI Check (cached)")
+                await progress_cb(f"[{ci_idx}/{total_steps}] Local CI Check (cached)")
             else:
-                await progress_cb(f"[5/{total_steps}] Local CI Check...")
-                await step_local_ci_check(ctx, settings, progress_cb, ci_commands, step_index=ci_idx)
+                await progress_cb(f"[{ci_idx}/{total_steps}] Local CI Check...")
+                await step_local_ci_check(ctx, settings, progress_cb, ci_commands,
+                                          step_index=ci_idx, max_retries_override=effective_ci_fix_retries)
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
 
-        # Re-resolve dynamic indices after possible CI step
-        self_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Sonnet Self-Review")
+        # Sonnet Self-Review (optional)
+        self_review_idx = _find_step("Sonnet Self-Review")
+        if self_review_idx is not None:
+            if _step_done(self_review_idx):
+                await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review (cached)")
+            else:
+                await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review...")
+                await step_sonnet_self_review(ctx, settings, cancel_event, progress_cb, step_index=self_review_idx)
 
-        # Step 5/6: Sonnet Self-Review (safe-fail)
-        if _step_done(self_review_idx):
-            await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review (cached)")
-        else:
-            await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review...")
-            await step_sonnet_self_review(ctx, settings, cancel_event, progress_cb, step_index=self_review_idx)
-
-        if cancel_event.is_set():
-            return "skipped", "Cancelled by user"
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
 
         # ── Phase C: Audit ──
-        cross_review_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "Gemini Cross-Review")
-        audit_idx = next(i for i, s in enumerate(ctx.steps) if s.name == "AI Audit")
 
-        # Gemini Cross-Review (non-fatal)
-        if _step_done(cross_review_idx):
-            await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review (cached)")
-        else:
-            await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review...")
-            await step_gemini_cross_review(ctx, gemini, settings, progress_cb, step_index=cross_review_idx)
+        # Gemini Cross-Review (optional)
+        cross_review_idx = _find_step("Gemini Cross-Review")
+        if cross_review_idx is not None:
+            if _step_done(cross_review_idx):
+                await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review (cached)")
+            else:
+                await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review...")
+                await step_gemini_cross_review(ctx, gemini, settings, progress_cb, step_index=cross_review_idx)
 
-        if cancel_event.is_set():
-            return "skipped", "Cancelled by user"
-
-        # AI Audit with retry loop
-        ctx.review_report = ctx.gemini_cross_review or ctx.self_review_report or "(no review available)"
-
-        for audit_attempt in range(settings.ai_audit_max_retries + 1):
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
 
-            audit_label = f" (retry {audit_attempt})" if audit_attempt > 0 else ""
-            await progress_cb(f"[{audit_idx}/{total_steps}] AI Audit{audit_label}...")
+        # AI Audit (optional, with retry loop)
+        audit_idx = _find_step("AI Audit")
+        if audit_idx is not None and effective_ai_audit_enabled:
+            ctx.review_report = ctx.gemini_cross_review or ctx.self_review_report or "(no review available)"
 
-            try:
-                await step_ai_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
-                break  # PASS
-            except RuntimeError:
-                if audit_attempt < settings.ai_audit_max_retries:
-                    # Audit failed — feed back to Sonnet for re-implementation
-                    ctx.audit_fix_history.append(
-                        f"audit retry {audit_attempt + 1}: {ctx.ai_audit_result[:200]}"
-                    )
-                    ctx.review_feedback = ctx.ai_audit_result
+            for audit_attempt in range(effective_ai_audit_max_retries + 1):
+                if cancel_event.is_set():
+                    return "skipped", "Cancelled by user"
 
-                    await progress_cb(f"AI Audit FAIL — Sonnet re-implementing (retry {audit_attempt + 1})...")
-                    # Reset to snapshot
-                    if ctx.impl_snapshot_ref:
-                        await _reset_to_snapshot(ctx.project_path, ctx.impl_snapshot_ref)
+                audit_label = f" (retry {audit_attempt})" if audit_attempt > 0 else ""
+                await progress_cb(f"[{audit_idx}/{total_steps}] AI Audit{audit_label}...")
 
-                    # Re-implement
-                    await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
-                    await _snapshot_commit(ctx.project_path, ctx.issue_num)
-                    ctx.git_diff = await _capture_filtered_diff(
-                        ctx.project_path, base_ref=ctx.base_commit or "main",
-                    )
+                try:
+                    await step_ai_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
+                    break  # PASS
+                except RuntimeError:
+                    if audit_attempt < effective_ai_audit_max_retries:
+                        ctx.audit_fix_history.append(
+                            f"audit retry {audit_attempt + 1}: {ctx.ai_audit_result[:200]}"
+                        )
+                        ctx.review_feedback = ctx.ai_audit_result
 
-                    # Re-run CI if applicable
-                    if ci_commands:
-                        await step_local_ci_check(ctx, settings, progress_cb, ci_commands, step_index=ci_idx)
+                        await progress_cb(f"AI Audit FAIL — Sonnet re-implementing (retry {audit_attempt + 1})...")
+                        if ctx.impl_snapshot_ref:
+                            await _reset_to_snapshot(ctx.project_path, ctx.impl_snapshot_ref)
 
-                    # Reset audit step for retry
-                    ctx.steps[audit_idx] = PipelineStep(name=f"AI Audit (retry {audit_attempt + 1})")
-                else:
-                    raise  # Final failure
+                        await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
+                        await _snapshot_commit(ctx.project_path, ctx.issue_num)
+                        ctx.git_diff = await _capture_filtered_diff(
+                            ctx.project_path, base_ref=ctx.base_commit or "main",
+                        )
+
+                        if ci_idx is not None and ci_commands:
+                            await step_local_ci_check(ctx, settings, progress_cb, ci_commands,
+                                                      step_index=ci_idx, max_retries_override=effective_ci_fix_retries)
+
+                        ctx.steps[audit_idx] = PipelineStep(name=f"AI Audit (retry {audit_attempt + 1})")
+                    else:
+                        raise  # Final failure
+        else:
+            # AI Audit skipped for this mode
+            ctx.ai_audit_passed = True
 
         # ── Phase D: Post-Process ──
-        if settings.enable_data_mining and ctx.ai_audit_passed:
-            ctx.steps.append(PipelineStep(name="Data Mining"))
+        if settings.enable_data_mining and (ctx.ai_audit_passed or not effective_ai_audit_enabled):
+            data_mining_idx = _find_step("Data Mining")
+            if data_mining_idx is None:
+                ctx.steps.append(PipelineStep(name="Data Mining"))
+                data_mining_idx = len(ctx.steps) - 1
             try:
-                await progress_cb(f"[{total_steps}/{total_steps}] Data Mining...")
-                await step_data_mining_fivebrid(ctx, ollama, settings, progress_cb, step_index=-1)
+                await progress_cb(f"[{data_mining_idx}/{len(ctx.steps)}] Data Mining...")
+                await step_data_mining_fivebrid(ctx, ollama, settings, progress_cb, step_index=data_mining_idx)
             except Exception as exc:
                 logger.warning("Data mining step failed (non-fatal): %s", exc)
 

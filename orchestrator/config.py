@@ -13,6 +13,46 @@ logger = logging.getLogger(__name__)
 
 _PROJECTS_FILE = Path(__file__).parent / "projects.json"
 
+# ── Adaptive Pipeline Modes ─────────────────────────────────────────────────
+
+PIPELINE_MODES = {
+    "express": {
+        "description": "Express",
+        "label": "3-Step",
+        "steps": ["Sonnet Implement", "Local CI Check", "Data Mining"],
+        "max_design_retries": 0,
+        "local_ci_fix_retries": 2,
+        "ai_audit_enabled": False,
+        "ai_audit_max_retries": 0,
+        "estimated_minutes": (5, 15),
+    },
+    "standard": {
+        "description": "Standard",
+        "label": "6-Step",
+        "steps": [
+            "Opus Design", "Gemini Design Critique",
+            "Sonnet Implement", "Local CI Check",
+            "Sonnet Self-Review", "Gemini Cross-Review",
+            "AI Audit", "Data Mining",
+        ],
+        "max_design_retries": 2,
+        "local_ci_fix_retries": 5,
+        "ai_audit_enabled": True,
+        "ai_audit_max_retries": 3,
+        "estimated_minutes": (15, 40),
+    },
+    "full": {
+        "description": "Full",
+        "label": "9-Step",
+        "steps": None,  # None = all steps
+        "max_design_retries": 3,
+        "local_ci_fix_retries": 7,
+        "ai_audit_enabled": True,
+        "ai_audit_max_retries": 5,
+        "estimated_minutes": (30, 90),
+    },
+}
+
 
 class Settings(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
@@ -98,6 +138,12 @@ class Settings(BaseSettings):
     local_ci_timeout: int = 180           # CI 커맨드 실행 타임아웃 (3분)
     local_ci_fix_timeout: int = 300       # Sonnet 수정 세션 타임아웃 (5분)
     local_ci_fatal: bool = True           # True: CI 실패 시 파이프라인 중단 (No-Red-PR)
+
+    # Adaptive Pipeline
+    solve_mode: str = "auto"  # "auto" | "express" | "standard" | "full"
+    triage_timeout: int = 30       # Haiku triage (seconds)
+    split_timeout: int = 120       # Opus split analysis (seconds)
+    strategy_approval_timeout: int = 300  # User approval wait (5 min)
 
     # AI Auditor (Intent-Based Cross-Model Audit)
     ai_audit_enabled: bool = True

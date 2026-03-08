@@ -150,6 +150,9 @@ def restore_context(checkpoint: dict) -> PipelineContext:
         ai_audit_passed=ctx_data.get("ai_audit_passed", False),
         ci_fix_history=ctx_data.get("ci_fix_history", []),
         audit_fix_history=ctx_data.get("audit_fix_history", []),
+        mode=ctx_data.get("mode", "standard"),
+        triage_reason=ctx_data.get("triage_reason", ""),
+        split_plan=ctx_data.get("split_plan", ""),
         steps=steps,
     )
     return ctx
