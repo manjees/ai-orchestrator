@@ -1159,10 +1159,18 @@ async def step_ai_audit(
         "'// loop through items', '// check if null', '// create instance', '// return result'\n"
         "   - Examples of GOOD comments: '// OAuth spec requires nonce per-request', "
         "'// Workaround for SQLite 3.x locking bug', '// Business rule: 30-day retention'\n\n"
-        "For each finding, classify as [CRITICAL], [MAJOR], or [MINOR].\n\n"
+        "For each finding, classify as:\n"
+        "- [CRITICAL]: Will cause runtime crash, data loss, or security breach in production\n"
+        "- [MAJOR]: Clearly violates the issue requirements OR introduces a real bug\n"
+        "- [MINOR]: Best practice suggestion, style preference, or 'nice to have'\n\n"
+        "IMPORTANT classification rules:\n"
+        "- Missing validation is [MINOR] unless the issue EXPLICITLY requires it\n"
+        "- Alternative API design choices (query param vs body) are [MINOR]\n"
+        "- If the code works correctly and tests pass, do NOT mark working design choices as [MAJOR]\n"
+        "- 'Could be improved' is ALWAYS [MINOR], never [MAJOR]\n\n"
         "End with exactly one of:\n"
-        "[AUDIT: PASS] — no critical or major issues\n"
-        "[AUDIT: FAIL] — critical issues found that must be fixed"
+        "[AUDIT: PASS] — no critical or major issues found\n"
+        "[AUDIT: FAIL] — critical or major issues found that MUST be fixed"
     )
 
     messages = [Message(role=Role.USER, content=user_content)]
