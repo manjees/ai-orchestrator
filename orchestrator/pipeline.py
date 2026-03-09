@@ -1351,7 +1351,7 @@ async def step_gemini_design_critique(
             step.status = "passed"
             step.detail = "DESIGN: APPROVED"
         elif verdict is False:
-            step.status = "failed"
+            step.status = "revised"
             step.detail = "DESIGN: NEEDS_REVISION"
         else:
             # No verdict tag found — treat as APPROVED to prevent infinite loop
@@ -1708,7 +1708,7 @@ async def run_fivebrid_pipeline(
                         )
 
                         critique_step = ctx.steps[current_critique_idx]
-                        if critique_step.status == "failed" and "NEEDS_REVISION" in critique_step.detail:
+                        if critique_step.status == "revised" and "NEEDS_REVISION" in critique_step.detail:
                             if iteration < effective_max_design_retries:
                                 await progress_cb(
                                     f"Design needs revision (iteration {iteration + 1}/{effective_max_design_retries + 1}), retrying..."
@@ -1990,6 +1990,7 @@ def format_pipeline_summary(ctx: PipelineContext) -> str:
         icon = {
             "passed": "\u2705",
             "failed": "\u274c",
+            "revised": "\U0001f504",
             "skipped": "\u23ed",
             "running": "\u23f3",
             "pending": "\u2b1c",
@@ -2001,7 +2002,7 @@ def format_pipeline_summary(ctx: PipelineContext) -> str:
             elapsed_str = f" ({mins}m {secs}s)" if mins else f" ({secs}s)"
 
         lines.append(f"  {icon} {s.name}{elapsed_str}")
-        if s.status == "failed" and s.detail:
+        if s.status in ("failed", "revised") and s.detail:
             detail_lines = s.detail[:500].split("\n")
             for dl in detail_lines[:5]:
                 lines.append(f"      \u2514 {dl}")
