@@ -2123,7 +2123,7 @@ async def run_fivebrid_pipeline(
     except asyncio.CancelledError:
         return "skipped", "Cancelled by user"
     except Exception as exc:
-        for s in ctx.steps:
+        for s in reversed(ctx.steps):
             if s.status == "failed":
                 return "failed", f"{s.name}: {s.detail}"
         return "failed", str(exc)[:200]
@@ -2316,8 +2316,8 @@ async def run_dual_check_pipeline(
     except asyncio.CancelledError:
         return "skipped", "Cancelled by user"
     except Exception as exc:
-        # Find which step failed
-        for s in ctx.steps:
+        # Find the LAST failed step (most recent failure is the actual cause)
+        for s in reversed(ctx.steps):
             if s.status == "failed":
                 return "failed", f"{s.name}: {s.detail}"
         return "failed", str(exc)[:200]
