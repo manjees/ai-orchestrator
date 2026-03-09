@@ -16,7 +16,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from .ai.anthropic_provider import AnthropicProvider
 from .ai.gemini_provider import GeminiCLIProvider
 from .ai.ollama_provider import OllamaProvider
 from .checkpoint import (
@@ -35,7 +34,6 @@ from .pipeline import (
     PipelineContext,
     format_intent_summary,
     format_pipeline_summary,
-    run_dual_check_pipeline,
     run_fivebrid_pipeline,
     run_init_pipeline,
     step_plan_issues,
@@ -1159,188 +1157,21 @@ async def _solve_single_issue(
     projects: dict = context.bot_data.get("projects", {})
     project_info = projects.get(project_name, {})
 
-    if settings.pipeline_mode == "fivebrid":
-        ollama: OllamaProvider | None = context.bot_data.get("ollama")
-        gemini: GeminiCLIProvider | None = context.bot_data.get("gemini")
-        if not ollama:
-            return "failed", "Fivebrid pipeline requires Ollama but it is not configured"
-        if not gemini:
-            return "failed", "Fivebrid pipeline requires Gemini CLI but it is not available"
-        return await _solve_with_fivebrid(
-            context, chat_id, project_name, project_path,
-            issue_num, timeout, cancel_event,
-            ollama, gemini, settings,
-            project_info=project_info,
-            solve_mode=solve_mode,
-            scheduler=scheduler,
-            supreme_court_cb=supreme_court_cb,
-        )
-    elif settings.dual_check_enabled:
-        ollama = context.bot_data.get("ollama")
-        anthropic: AnthropicProvider | None = context.bot_data.get("anthropic")
-        if not ollama:
-            return "failed", "Dual-check requires Ollama but it is not configured"
-        return await _solve_with_dual_check(
-            context, chat_id, project_name, project_path,
-            issue_num, timeout, cancel_event,
-            ollama, anthropic, settings,
-            project_info=project_info,
-        )
-    else:
-        return await _solve_direct_claude(
-            context, chat_id, project_name, project_path,
-            issue_num, timeout, cancel_event,
-        )
-
-
-async def _solve_with_dual_check(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    project_name: str,
-    project_path: str,
-    issue_num: int,
-    timeout: int,
-    cancel_event: asyncio.Event,
-    ollama: OllamaProvider,
-    anthropic: AnthropicProvider | None,
-    settings,
-    project_info: dict | None = None,
-) -> tuple[str, str]:
-    """Solve via dual-check pipeline."""
-    branch_name = f"solve/issue-{issue_num}"
-
-    cancel_btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Cancel", callback_data=f"cancel_solve:{chat_id}:{issue_num}")]
-    ])
-    msg = await context.bot.send_message(
-        chat_id,
-        f"<b>#{issue_num}</b> [0/4] Preparing git worktree...",
-        parse_mode=ParseMode.HTML,
-        reply_markup=cancel_btn,
+    ollama: OllamaProvider | None = context.bot_data.get("ollama")
+    gemini: GeminiCLIProvider | None = context.bot_data.get("gemini")
+    if not ollama:
+        return "failed", "Pipeline requires Ollama but it is not configured"
+    if not gemini:
+        return "failed", "Pipeline requires Gemini CLI but it is not available"
+    return await _solve_with_fivebrid(
+        context, chat_id, project_name, project_path,
+        issue_num, timeout, cancel_event,
+        ollama, gemini, settings,
+        project_info=project_info,
+        solve_mode=solve_mode,
+        scheduler=scheduler,
+        supreme_court_cb=supreme_court_cb,
     )
-
-    pipeline_start = time.monotonic()
-
-    worktree_dir = ""
-    try:
-        # ── Git Worktree Setup ──
-        git_ok, git_result = await _git_fresh_start(project_path, branch_name)
-        if not git_ok:
-            await _edit_msg(msg, f"<b>#{issue_num}</b> — Git setup failed:\n<pre>{_sanitize_output(git_result)}</pre>")
-            return "failed", f"Git setup failed: {git_result[:100]}"
-
-        worktree_dir = git_result  # on success, this is the worktree path
-
-        # Capture base commit for accurate diffing (only this session's changes)
-        base_proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "HEAD",
-            cwd=worktree_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        base_out, _ = await asyncio.wait_for(base_proc.communicate(), timeout=5)
-        base_commit = base_out.decode().strip() if base_out else ""
-
-        if cancel_event.is_set():
-            return "skipped", "Cancelled by user"
-
-        # Build pipeline context — use worktree_dir as working directory
-        ctx = PipelineContext(
-            project_path=worktree_dir,
-            project_name=project_name,
-            issue_num=issue_num,
-            branch_name=branch_name,
-            base_commit=base_commit,
-        )
-
-        # Progress callback: update Telegram message
-        async def progress_cb(status_text: str) -> None:
-            elapsed = int(time.monotonic() - pipeline_start)
-            mins, secs = divmod(elapsed, 60)
-            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            try:
-                sys_status = await get_system_status()
-                sys_line = f"CPU: {sys_status.cpu_percent}% | RAM: {sys_status.ram_percent}%"
-            except Exception:
-                sys_line = ""
-
-            text = (
-                f"<b>#{issue_num}</b> {html.escape(status_text)}\n"
-                f"[{time_str}] {sys_line}"
-            )
-            await _edit_msg(msg, text, reply_markup=cancel_btn)
-
-        # Run pipeline
-        status, detail = await run_dual_check_pipeline(
-            ctx, ollama, anthropic, settings, cancel_event, progress_cb,
-            project_info=project_info,
-        )
-
-        elapsed = int(time.monotonic() - pipeline_start)
-        mins, secs = divmod(elapsed, 60)
-        total_time = f"{mins}m {secs}s" if mins else f"{secs}s"
-
-        if status == "success" and cancel_event.is_set():
-            summary = format_pipeline_summary(ctx)
-            await _edit_msg(
-                msg,
-                f"<b>#{issue_num}</b> ⏭ Cancelled before PR creation\n[{total_time}]\n\n"
-                f"<b>Pipeline Steps:</b>\n{html.escape(summary)}",
-            )
-            return "skipped", "Cancelled before PR creation"
-
-        if status == "success":
-            # Create PR — push from worktree
-            await _edit_msg(msg, f"<b>#{issue_num}</b> — Creating PR...")
-            pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
-
-            intent_summary = format_intent_summary(ctx)
-            step_summary = format_pipeline_summary(ctx)
-            if pr_url:
-                # Success — clean up checkpoint
-                delete_checkpoint(project_name, issue_num)
-                await delete_checkpoint_tag(project_path, project_name, issue_num)
-                await _edit_msg(
-                    msg,
-                    f"<b>#{issue_num}</b> \u2705 Solved in {total_time}\nPR: {pr_url}\n\n"
-                    f"{html.escape(intent_summary)}\n\n"
-                    f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
-                )
-                return "success", f"PR created: {pr_url}"
-            else:
-                await _edit_msg(
-                    msg,
-                    f"<b>#{issue_num}</b> — Pipeline passed but PR failed:\n"
-                    f"<pre>{_sanitize_output(pr_err)}</pre>\n\n"
-                    f"{html.escape(intent_summary)}\n\n"
-                    f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
-                )
-                return "failed", f"PR creation failed: {pr_err[:100]}"
-        else:
-            # Failed — add retry hint if checkpoint is possible
-            retry_hint = ""
-            if ctx and ctx.impl_snapshot_ref:
-                retry_hint = f"\n\n💡 <code>/retry {html.escape(project_name)} {issue_num}</code>"
-            intent_summary = format_intent_summary(ctx)
-            step_summary = format_pipeline_summary(ctx)
-            await _edit_msg(
-                msg,
-                f"<b>#{issue_num}</b> \u274c {html.escape(status)}: {html.escape(detail[:200])}\n"
-                f"[{total_time}]\n\n"
-                f"{html.escape(intent_summary)}\n\n"
-                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}"
-                f"{retry_hint}",
-            )
-            return status, detail
-
-    except Exception as exc:
-        logger.exception("Error in dual-check pipeline for issue #%d", issue_num)
-        await _edit_msg(msg, f"<b>#{issue_num}</b> — Error: {html.escape(str(exc)[:200])}")
-        return "failed", str(exc)[:100]
-    finally:
-        if worktree_dir:
-            await _save_checkpoint_on_failure(ctx, worktree_dir, project_name, issue_num, "dual_check")
-            await _cleanup_worktree(project_path, worktree_dir, branch_name)
 
 
 async def _solve_with_fivebrid(
@@ -1659,152 +1490,6 @@ async def _solve_with_fivebrid(
         if worktree_dir:
             if ctx is not None:
                 await _save_checkpoint_on_failure(ctx, worktree_dir, project_name, issue_num, "fivebrid")
-            await _cleanup_worktree(project_path, worktree_dir, branch_name)
-
-
-async def _solve_direct_claude(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    project_name: str,
-    project_path: str,
-    issue_num: int,
-    timeout: int,
-    cancel_event: asyncio.Event,
-) -> tuple[str, str]:
-    """Original Claude-only solve logic (dual_check_enabled=false)."""
-    branch_name = f"solve/issue-{issue_num}"
-
-    cancel_btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Cancel", callback_data=f"cancel_solve:{chat_id}:{issue_num}")]
-    ])
-    msg = await context.bot.send_message(
-        chat_id,
-        f"<b>#{issue_num}</b> — Preparing git worktree...",
-        parse_mode=ParseMode.HTML,
-        reply_markup=cancel_btn,
-    )
-
-    worktree_dir = ""
-    try:
-        # ── Git Worktree Setup ──
-        git_ok, git_result = await _git_fresh_start(project_path, branch_name)
-        if not git_ok:
-            await _edit_msg(msg, f"<b>#{issue_num}</b> — Git setup failed:\n<pre>{_sanitize_output(git_result)}</pre>")
-            return "failed", f"Git setup failed: {git_result[:100]}"
-
-        worktree_dir = git_result
-
-        if cancel_event.is_set():
-            return "skipped", "Cancelled by user"
-
-        # ── Claude execution ──
-        await _edit_msg(
-            msg,
-            f"<b>#{issue_num}</b> — Running Claude...",
-            reply_markup=cancel_btn,
-        )
-
-        claude_cmd = (
-            f'claude -p --dangerously-skip-permissions '
-            f'"Read .claude/CLAUDE.md first and follow the defined pipeline. '
-            f'Then read GitHub issue #{issue_num} with gh issue view {issue_num}. '
-            f'Implement the solution. Complete all steps including testing."'
-        )
-
-        start = time.monotonic()
-        proc = await asyncio.create_subprocess_shell(
-            claude_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=worktree_dir,
-        )
-        assert proc.stdout is not None
-
-        collected = ""
-
-        async def _read_output() -> None:
-            nonlocal collected
-            async for line in proc.stdout:  # type: ignore[union-attr]
-                collected += line.decode(errors="replace")
-
-        read_task = asyncio.create_task(_read_output())
-
-        # Streaming updates every 10s
-        while not read_task.done():
-            await asyncio.sleep(10)
-
-            if cancel_event.is_set():
-                proc.kill()
-                await read_task
-                return "skipped", "Cancelled by user"
-
-            elapsed = int(time.monotonic() - start)
-            if elapsed > timeout:
-                proc.kill()
-                await read_task
-                return "failed", f"Timed out after {timeout}s"
-
-            mins, secs = divmod(elapsed, 60)
-            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-
-            # Get system stats for the progress message
-            try:
-                sys_status = await get_system_status()
-                sys_line = f"CPU: {sys_status.cpu_percent}% | RAM: {sys_status.ram_percent}%"
-            except Exception:
-                sys_line = ""
-
-            preview = _sanitize_output(mask_secrets(collected[-500:])) if collected else "(waiting...)"
-            text = (
-                f"<b>#{issue_num}</b> — Running Claude [{time_str}]\n"
-                f"{sys_line}\n"
-                f"<pre>{preview}</pre>"
-            )
-            await _edit_msg(msg, text, reply_markup=cancel_btn)
-
-        try:
-            await asyncio.wait_for(read_task, timeout=10)
-        except asyncio.TimeoutError:
-            pass
-        await proc.wait()
-
-        elapsed = int(time.monotonic() - start)
-        mins, secs = divmod(elapsed, 60)
-        time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-        rc = proc.returncode
-
-        if rc != 0:
-            preview = _sanitize_output(mask_secrets(collected[-1000:])) if collected else "(no output)"
-            await _edit_msg(
-                msg,
-                f"<b>#{issue_num}</b> — Claude failed (exit={rc}, {time_str})\n<pre>{preview}</pre>",
-            )
-            return "failed", f"Claude exit={rc} after {time_str}"
-
-        # ── Cancel check before PR ──
-        if cancel_event.is_set():
-            return "skipped", f"Cancelled before PR creation (Claude done in {time_str})"
-
-        # ── Auto PR ──
-        await _edit_msg(msg, f"<b>#{issue_num}</b> — Claude done ({time_str}). Creating PR...")
-
-        pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name)
-        if pr_url:
-            await _edit_msg(msg, f"<b>#{issue_num}</b> \u2705 Solved in {time_str}\nPR: {pr_url}")
-            return "success", f"PR created: {pr_url}"
-        else:
-            await _edit_msg(
-                msg,
-                f"<b>#{issue_num}</b> — Claude done but PR failed:\n<pre>{_sanitize_output(pr_err)}</pre>",
-            )
-            return "failed", f"PR creation failed: {pr_err[:100]}"
-
-    except Exception as exc:
-        logger.exception("Error solving issue #%d", issue_num)
-        await _edit_msg(msg, f"<b>#{issue_num}</b> — Error: {html.escape(str(exc)[:200])}")
-        return "failed", str(exc)[:100]
-    finally:
-        if worktree_dir:
             await _cleanup_worktree(project_path, worktree_dir, branch_name)
 
 
@@ -3300,28 +2985,16 @@ async def _retry_from_checkpoint(
             await _edit_msg(msg, text, reply_markup=cancel_btn)
 
         # Run resumed pipeline
-        if pipeline_mode == "fivebrid":
-            ollama: OllamaProvider | None = context.bot_data.get("ollama")
-            gemini: GeminiCLIProvider | None = context.bot_data.get("gemini")
-            if not ollama or not gemini:
-                await _edit_msg(msg, f"<b>#{issue_num}</b> ❌ Fivebrid requires Ollama + Gemini")
-                return
-            status, detail = await run_fivebrid_pipeline(
-                ctx, ollama, gemini, settings, cancel_event, progress_cb,
-                project_info=project_info,
-                resume_from_step=failed_idx,
-            )
-        else:
-            ollama = context.bot_data.get("ollama")
-            anthropic: AnthropicProvider | None = context.bot_data.get("anthropic")
-            if not ollama:
-                await _edit_msg(msg, f"<b>#{issue_num}</b> ❌ Dual-check requires Ollama")
-                return
-            status, detail = await run_dual_check_pipeline(
-                ctx, ollama, anthropic, settings, cancel_event, progress_cb,
-                project_info=project_info,
-                resume_from_step=failed_idx,
-            )
+        ollama: OllamaProvider | None = context.bot_data.get("ollama")
+        gemini: GeminiCLIProvider | None = context.bot_data.get("gemini")
+        if not ollama or not gemini:
+            await _edit_msg(msg, f"<b>#{issue_num}</b> ❌ Pipeline requires Ollama + Gemini")
+            return
+        status, detail = await run_fivebrid_pipeline(
+            ctx, ollama, gemini, settings, cancel_event, progress_cb,
+            project_info=project_info,
+            resume_from_step=failed_idx,
+        )
 
         elapsed = int(time.monotonic() - pipeline_start)
         mins, secs = divmod(elapsed, 60)

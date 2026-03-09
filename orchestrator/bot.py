@@ -12,7 +12,6 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from .ai.anthropic_provider import AnthropicProvider
 from .ai.gemini_provider import GeminiCLIProvider
 from .ai.ollama_provider import OllamaProvider
 from .config import Settings, load_projects
@@ -84,22 +83,13 @@ async def _post_init(app: Application) -> None:
         except Exception:
             pass  # Bot init phase — send may fail
 
-    # Anthropic provider (only if API key is configured)
-    if settings.anthropic_api_key:
-        anthropic = AnthropicProvider(
-            api_key=settings.anthropic_api_key,
-            model=settings.anthropic_model,
-        )
-        app.bot_data["anthropic"] = anthropic
-
-    # Gemini CLI provider (for fivebrid pipeline)
-    if settings.pipeline_mode == "fivebrid":
-        gemini = GeminiCLIProvider(model=settings.gemini_model)
-        if await gemini.is_available():
-            app.bot_data["gemini"] = gemini
-            logger.info("Gemini CLI provider initialized (model=%s)", settings.gemini_model)
-        else:
-            logger.warning("Gemini CLI not available — fivebrid pipeline will fail on Gemini steps")
+    # Gemini CLI provider
+    gemini = GeminiCLIProvider(model=settings.gemini_model)
+    if await gemini.is_available():
+        app.bot_data["gemini"] = gemini
+        logger.info("Gemini CLI provider initialized (model=%s)", settings.gemini_model)
+    else:
+        logger.warning("Gemini CLI not available — pipeline will fail on Gemini steps")
 
     # Register command menu for Telegram autocomplete
     await app.bot.set_my_commands([
@@ -124,7 +114,7 @@ async def _post_init(app: Application) -> None:
 
 async def _post_shutdown(app: Application) -> None:
     """Gracefully close AI provider clients."""
-    for key in ("ollama", "anthropic", "gemini"):
+    for key in ("ollama", "gemini"):
         provider = app.bot_data.get(key)
         if provider is not None:
             await provider.close()

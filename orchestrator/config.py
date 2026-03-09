@@ -62,35 +62,21 @@ class Settings(BaseSettings):
     telegram_allowed_user_id: int
 
     # Optional
-    anthropic_api_key: str = ""
     ollama_base_url: str = "http://localhost:11434"
-    reasoning_model: str = "deepseek-r1:32b"     # CoT reasoning (Critique, Audit)
-    anthropic_model: str = "claude-sonnet-4-5-20250929"
+    reasoning_model: str = "deepseek-r1:32b"     # CoT reasoning (Audit)
     tmux_session_name: str = "ai_factory"
     log_level: str = "INFO"
     cmd_timeout: int = 30
     cmd_long_timeout: int = 600
     solve_timeout: int = 3600  # per-issue timeout (60 min)
 
-    # Dual-Check System
-    dual_check_enabled: bool = True
-    deepseek_design_timeout: int = 600   # Step 1: 10 min
-    claude_review_timeout: int = 900     # Step 3: 15 min
-    deepseek_audit_timeout: int = 600    # Step 4: 10 min
-    deepseek_design_max_tokens: int = 8192
-    deepseek_audit_max_tokens: int = 4096
-    max_review_retries: int = 2
-
-    # Triple-Model Hybrid (Qwen)
-    qwen_model: str = "qwen3.5:35b"           # Action (Hints, Data Mining, /plan, /discuss)
+    # Qwen (Hints, Data Mining, /plan, /discuss)
+    qwen_model: str = "qwen3.5:35b"
     enable_data_mining: bool = True
-    qwen_impl_timeout: int = 600          # Step 2: Qwen pre-impl (10 min)
-    data_mining_timeout: int = 300         # Step 5: training data gen (5 min)
+    qwen_impl_timeout: int = 600          # Qwen pre-impl hints (10 min)
+    data_mining_timeout: int = 300         # training data gen (5 min)
     data_mining_max_tokens: int = 4096
     training_data_dir: str = ""            # Empty = default to ai-orchestrator/data/training/
-
-    # Five-brid Pipeline
-    pipeline_mode: str = "legacy"          # "legacy" | "fivebrid"
 
     # Gemini
     gemini_model: str = "gemini-2.5-pro"
