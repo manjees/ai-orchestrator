@@ -1395,13 +1395,36 @@ async def _solve_with_fivebrid(
                 if ctx.split_plan and triage_result.get("sub_issues"):
                     sub_issues = triage_result["sub_issues"]
                     created_nums: list[int] = []
+
+                    # Fetch labels from parent issue
+                    parent_labels: list[str] = []
+                    try:
+                        lbl_proc = await asyncio.create_subprocess_exec(
+                            "gh", "issue", "view", str(issue_num),
+                            "--json", "labels", "--jq", ".[\"labels\"][].name",
+                            "--repo", f"{settings.github_user}/{project_name}",
+                            cwd=project_path,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        lbl_out, _ = await asyncio.wait_for(lbl_proc.communicate(), timeout=15)
+                        if lbl_proc.returncode == 0 and lbl_out:
+                            parent_labels = [l.strip() for l in lbl_out.decode().strip().splitlines() if l.strip()]
+                    except Exception:
+                        logger.warning("Failed to fetch labels for #%d", issue_num)
+
                     for sub in sub_issues:
                         try:
-                            proc = await asyncio.create_subprocess_exec(
+                            create_cmd = [
                                 "gh", "issue", "create",
                                 "--title", sub["title"],
                                 "--body", f"(Auto-split from #{issue_num})\n\n{sub['body']}",
                                 "--repo", f"{settings.github_user}/{project_name}",
+                            ]
+                            for label in parent_labels:
+                                create_cmd.extend(["--label", label])
+                            proc = await asyncio.create_subprocess_exec(
+                                *create_cmd,
                                 cwd=project_path,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
