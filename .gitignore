@@ -10,3 +10,7 @@ orchestrator/projects.json
 .claude/
 .DS_Store
 orchestrator/.checkpoints/
+build-tools/
+platforms/
+licenses/
+.knownPackages
