@@ -163,7 +163,7 @@ def detect_ci_commands(project_path: str) -> list[str]:
 
     # Gradle (KMP, Android, JVM)
     if (p / "gradlew").exists():
-        return ["./gradlew check"]
+        return ["./gradlew ktlintFormat", "./gradlew check"]
 
     # Node.js
     pkg_json = p / "package.json"
