@@ -773,7 +773,7 @@ async def step_claude_implement(
     prompt = (
         f"Read .claude/CLAUDE.md first and follow the defined pipeline. "
         f"Then read GitHub issue #{ctx.issue_num} with `gh issue view {ctx.issue_num}`. "
-        f"\n\n--- Design Guide (from DeepSeek) ---\n{ctx.design_doc}\n---\n"
+        f"\n\n--- Design Guide (from Opus) ---\n{ctx.design_doc}\n---\n"
         f"{qwen_section}\n"
         f"Implement the solution following this design guide using TDD:\n"
         f"1. Write failing tests FIRST that define the expected behavior\n"
