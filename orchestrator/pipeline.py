@@ -801,17 +801,15 @@ async def step_claude_implement(
             f"The previous implementation was rejected. Fix ALL issues mentioned above."
         )
 
-    claude_cmd = (
-        f'claude -p --dangerously-skip-permissions '
-        f'{_shell_quote(prompt)}'
-    )
-
-    proc = await asyncio.create_subprocess_shell(
-        claude_cmd,
+    proc = await asyncio.create_subprocess_exec(
+        "claude", "-p", "--dangerously-skip-permissions",
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=ctx.project_path,
     )
+    proc.stdin.write(prompt.encode())  # type: ignore[union-attr]
+    proc.stdin.close()  # type: ignore[union-attr]
     assert proc.stdout is not None
 
     collected = ""
@@ -871,7 +869,9 @@ async def step_claude_implement(
 
         if not ctx.git_diff.strip():
             step.status = "failed"
-            step.detail = "No changes produced"
+            tail = collected[-500:].strip() if collected else "(no output)"
+            logger.warning("Sonnet produced no changes. Output tail:\n%s", tail)
+            step.detail = f"No changes produced. Output: {tail[:300]}"
             step.elapsed_sec = time.monotonic() - start
             raise RuntimeError("Claude produced no code changes")
 
