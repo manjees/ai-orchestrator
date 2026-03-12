@@ -1374,6 +1374,18 @@ async def _solve_with_fivebrid(
             )
             return "skipped", "Cancelled before PR creation"
 
+        if status == "success" and "Already implemented" in detail:
+            # Issue already resolved on main — skip PR, report and clean up
+            delete_checkpoint(project_name, issue_num)
+            await delete_checkpoint_tag(project_path, project_name, issue_num)
+            step_summary = format_pipeline_summary(ctx)
+            await _edit_msg(
+                msg,
+                f"<b>#{issue_num}</b> \u2705 Already implemented — no PR needed [{total_time}]\n\n"
+                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
+            )
+            return "success", detail
+
         if status == "success":
             await _edit_msg(msg, f"<b>#{issue_num}</b> — Creating PR...")
             pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
@@ -3023,7 +3035,16 @@ async def _retry_from_checkpoint(
         mins, secs = divmod(elapsed, 60)
         total_time = f"{mins}m {secs}s" if mins else f"{secs}s"
 
-        if status == "success":
+        if status == "success" and "Already implemented" in detail:
+            delete_checkpoint(project_name, issue_num)
+            await delete_checkpoint_tag(project_path, project_name, issue_num)
+            step_summary = format_pipeline_summary(ctx)
+            await _edit_msg(
+                msg,
+                f"<b>#{issue_num}</b> ✅ Already implemented — no PR needed [{total_time}]\n\n"
+                f"<b>Pipeline Steps:</b>\n{html.escape(step_summary)}",
+            )
+        elif status == "success":
             await _edit_msg(msg, f"<b>#{issue_num}</b> 🔄 Creating PR...")
             pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
 

@@ -144,6 +144,26 @@ def parse_ruling(text: str) -> str:
     return "UPHOLD"
 
 
+def _detect_already_implemented(sonnet_output: str) -> bool:
+    """Detect if Sonnet's output indicates the issue is already implemented."""
+    lower = sonnet_output.lower()
+    signals = [
+        "already implemented",
+        "already exists",
+        "already been implemented",
+        "already in place",
+        "nothing to change",
+        "no changes needed",
+        "no changes required",
+        "no modifications needed",
+        "code already",
+        "functionality already",
+        "feature already",
+        "implementation already",
+    ]
+    return any(s in lower for s in signals)
+
+
 # ── Git Diff Filtering ───────────────────────────────────────────────────────
 
 DIFF_EXCLUDE_PATTERNS = [
@@ -879,51 +899,28 @@ async def step_claude_implement(
         # Snapshot commit so diff is clean
         await _snapshot_commit(ctx.project_path, ctx.issue_num)
 
-        # Debug: log git state before diff capture
-        _dbg_head = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "HEAD",
-            cwd=ctx.project_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        _dbg_out, _ = await asyncio.wait_for(_dbg_head.communicate(), timeout=5)
-        _head_sha = _dbg_out.decode().strip() if _dbg_out else "?"
-
-        _dbg_log = await asyncio.create_subprocess_exec(
-            "git", "log", "--oneline", "-10",
-            cwd=ctx.project_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        _dbg_log_out, _ = await asyncio.wait_for(_dbg_log.communicate(), timeout=5)
-        _log_text = _dbg_log_out.decode().strip() if _dbg_log_out else "?"
-
-        _dbg_stat = await asyncio.create_subprocess_exec(
-            "git", "diff", "--stat", f"{ctx.base_commit or 'main'}..HEAD",
-            cwd=ctx.project_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        _dbg_stat_out, _ = await asyncio.wait_for(_dbg_stat.communicate(), timeout=5)
-        _stat_text = _dbg_stat_out.decode().strip() if _dbg_stat_out else "(empty)"
-
-        logger.info(
-            "Implement diff debug: base=%s HEAD=%s\nlog:\n%s\nstat:\n%s",
-            ctx.base_commit, _head_sha, _log_text, _stat_text,
-        )
-
         # Capture filtered diff
         ctx.git_diff = await _capture_filtered_diff(
             ctx.project_path, base_ref=ctx.base_commit or "main",
         )
 
         if not ctx.git_diff.strip():
-            step.status = "failed"
-            tail = collected[-500:].strip() if collected else "(no output)"
-            logger.warning("Sonnet produced no changes. Output tail:\n%s", tail)
-            step.detail = f"No changes produced. Output: {tail[:300]}"
-            step.elapsed_sec = time.monotonic() - start
-            raise RuntimeError("Claude produced no code changes")
-
-        step.status = "passed"
-        step.detail = f"exit=0, diff={len(ctx.git_diff)} chars"
+            # Check if Sonnet indicated the work is already done
+            tail = collected[-1000:].strip() if collected else ""
+            if _detect_already_implemented(tail):
+                logger.info("Sonnet reports issue already implemented — treating as success")
+                step.status = "passed"
+                step.detail = "Already implemented (no changes needed)"
+                ctx.git_diff = "(already implemented)"
+            else:
+                step.status = "failed"
+                logger.warning("Sonnet produced no changes. Output tail:\n%s", tail[-500:])
+                step.detail = f"No changes produced. Output: {tail[:300]}"
+                step.elapsed_sec = time.monotonic() - start
+                raise RuntimeError("Claude produced no code changes")
+        else:
+            step.status = "passed"
+            step.detail = f"exit=0, diff={len(ctx.git_diff)} chars"
     except (asyncio.CancelledError, TimeoutError, RuntimeError):
         raise
     except Exception as exc:
@@ -1813,6 +1810,13 @@ async def run_fivebrid_pipeline(
         # Notify scheduler: implement done
         if scheduler:
             scheduler.notify_implement_done(ctx.issue_num)
+
+        # Early exit: issue already implemented — skip review/audit/PR
+        if ctx.git_diff == "(already implemented)":
+            if scheduler:
+                scheduler.notify_audit_approved(ctx.issue_num)
+            ctx.ai_audit_passed = True
+            return "success", "Already implemented — no changes needed"
 
         if cancel_event.is_set():
             if scheduler:
