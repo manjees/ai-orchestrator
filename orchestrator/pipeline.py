@@ -536,6 +536,23 @@ async def _capture_filtered_diff(project_path: str, base_ref: str = "main") -> s
     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
     diff = stdout.decode(errors="replace") if stdout else ""
 
+    # Fallback: if filtered diff is empty, check unfiltered diff
+    if not diff.strip():
+        raw_proc = await asyncio.create_subprocess_exec(
+            "git", "diff", diff_range,
+            cwd=project_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        raw_out, _ = await asyncio.wait_for(raw_proc.communicate(), timeout=30)
+        raw_diff = raw_out.decode(errors="replace") if raw_out else ""
+        if raw_diff.strip():
+            logger.warning(
+                "Filtered diff was empty but raw diff has %d chars — "
+                "exclude patterns may be too broad", len(raw_diff),
+            )
+            diff = raw_diff
+
     if len(diff) > _MAX_DIFF_CHARS:
         # Capture stat summary as fallback context
         stat_proc = await asyncio.create_subprocess_exec(
