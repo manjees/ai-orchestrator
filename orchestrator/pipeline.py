@@ -879,6 +879,36 @@ async def step_claude_implement(
         # Snapshot commit so diff is clean
         await _snapshot_commit(ctx.project_path, ctx.issue_num)
 
+        # Debug: log git state before diff capture
+        _dbg_head = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "HEAD",
+            cwd=ctx.project_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _dbg_out, _ = await asyncio.wait_for(_dbg_head.communicate(), timeout=5)
+        _head_sha = _dbg_out.decode().strip() if _dbg_out else "?"
+
+        _dbg_log = await asyncio.create_subprocess_exec(
+            "git", "log", "--oneline", "-10",
+            cwd=ctx.project_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _dbg_log_out, _ = await asyncio.wait_for(_dbg_log.communicate(), timeout=5)
+        _log_text = _dbg_log_out.decode().strip() if _dbg_log_out else "?"
+
+        _dbg_stat = await asyncio.create_subprocess_exec(
+            "git", "diff", "--stat", f"{ctx.base_commit or 'main'}..HEAD",
+            cwd=ctx.project_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _dbg_stat_out, _ = await asyncio.wait_for(_dbg_stat.communicate(), timeout=5)
+        _stat_text = _dbg_stat_out.decode().strip() if _dbg_stat_out else "(empty)"
+
+        logger.info(
+            "Implement diff debug: base=%s HEAD=%s\nlog:\n%s\nstat:\n%s",
+            ctx.base_commit, _head_sha, _log_text, _stat_text,
+        )
+
         # Capture filtered diff
         ctx.git_diff = await _capture_filtered_diff(
             ctx.project_path, base_ref=ctx.base_commit or "main",
