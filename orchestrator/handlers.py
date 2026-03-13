@@ -1151,6 +1151,7 @@ async def _solve_single_issue(
     solve_mode: str | None = None,
     scheduler=None,
     supreme_court_cb=None,
+    dashboard_client=None,
 ) -> tuple[str, str]:
     """Solve one issue. Routes to fivebrid, dual-check, or direct-claude based on settings."""
     settings = context.bot_data["settings"]
@@ -1163,6 +1164,8 @@ async def _solve_single_issue(
         return "failed", "Pipeline requires Ollama but it is not configured"
     if not gemini:
         return "failed", "Pipeline requires Gemini CLI but it is not available"
+    if dashboard_client is None:
+        dashboard_client = context.bot_data.get("dashboard")
     return await _solve_with_fivebrid(
         context, chat_id, project_name, project_path,
         issue_num, timeout, cancel_event,
@@ -1171,6 +1174,7 @@ async def _solve_single_issue(
         solve_mode=solve_mode,
         scheduler=scheduler,
         supreme_court_cb=supreme_court_cb,
+        dashboard_client=dashboard_client,
     )
 
 
@@ -1189,6 +1193,7 @@ async def _solve_with_fivebrid(
     solve_mode: str | None = None,
     scheduler=None,
     supreme_court_cb=None,
+    dashboard_client=None,
 ) -> tuple[str, str]:
     """Solve via adaptive Five-brid pipeline."""
     branch_name = f"solve/issue-{issue_num}"
@@ -1359,6 +1364,7 @@ async def _solve_with_fivebrid(
             project_info=project_info,
             scheduler=scheduler,
             supreme_court_cb=supreme_court_cb,
+            dashboard_client=dashboard_client,
         )
 
         elapsed = int(time.monotonic() - pipeline_start)
