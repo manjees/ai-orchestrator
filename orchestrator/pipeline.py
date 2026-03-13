@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 import httpx
 
@@ -24,11 +24,42 @@ from .ai.ollama_provider import OllamaProvider
 from .config import PIPELINE_MODES, Settings
 from .security import mask_secrets
 
+if TYPE_CHECKING:
+    from .dashboard_client import DashboardClient
+
 logger = logging.getLogger(__name__)
 
 # ── Data Structures ──────────────────────────────────────────────────────────
 
 ProgressCallback = Callable[[str], Awaitable[None]]
+
+_STEP_AGENT_MAP: dict[str, str] = {
+    "Haiku Research": "haiku-researcher",
+    "Opus Design": "opus-designer",
+    "Gemini Design Critique": "gemini-reviewer",
+    "Qwen Hints": "qwen-worker",
+    "Sonnet Implement": "sonnet-worker",
+    "Local CI Check": "orchestrator",
+    "Sonnet Self-Review": "sonnet-worker",
+    "Gemini Cross-Review": "gemini-reviewer",
+    "AI Audit": "deepseek-auditor",
+    "Data Mining": "qwen-worker",
+}
+
+
+async def _notify_step(
+    dashboard_client: "DashboardClient | None", step_name: str, status: str,
+) -> None:
+    if dashboard_client is None:
+        return
+    agent_id = _STEP_AGENT_MAP.get(step_name)
+    if not agent_id:
+        logger.debug("No agent mapping for step %r, skipping notification", step_name)
+        return
+    try:
+        await dashboard_client.update_agent_status(agent_id, status)
+    except Exception:
+        logger.warning("Failed to notify dashboard for %s → %s", agent_id, status, exc_info=True)
 
 
 @dataclass
@@ -1654,6 +1685,7 @@ async def run_fivebrid_pipeline(
     resume_from_step: int = -1,
     scheduler: "StaggeredScheduler | None" = None,
     supreme_court_cb: Callable | None = None,
+    dashboard_client: "DashboardClient | None" = None,
 ) -> tuple[str, str]:
     """Run the adaptive Five-brid pipeline. Returns (status, detail)."""
     from .scheduler import StaggeredScheduler  # noqa: F811
@@ -1681,6 +1713,17 @@ async def run_fivebrid_pipeline(
         return next((i for i, s in enumerate(ctx.steps) if s.name == name), None)
 
     try:
+        if dashboard_client:
+            try:
+                await dashboard_client.send_event("PIPELINE_STARTED", {
+                    "issue_num": ctx.issue_num,
+                    "mode": ctx.mode,
+                    "project_name": ctx.project_name,
+                })
+                logger.debug("Dashboard: PIPELINE_STARTED for issue #%s", ctx.issue_num)
+            except Exception:
+                logger.warning("Failed to send PIPELINE_STARTED event", exc_info=True)
+
         # Fetch issue (skip if already populated by triage or checkpoint)
         if ctx.issue_body:
             if resuming:
@@ -1701,7 +1744,9 @@ async def run_fivebrid_pipeline(
                 await progress_cb(f"[{research_idx}/{total_steps}] Haiku Research (cached)")
             else:
                 await progress_cb(f"[{research_idx}/{total_steps}] Haiku Research...")
+                await _notify_step(dashboard_client, "Haiku Research", "RUNNING")
                 await step_haiku_research(ctx, settings, progress_cb, step_index=research_idx)
+                await _notify_step(dashboard_client, "Haiku Research", "IDLE")
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
@@ -1737,7 +1782,9 @@ async def run_fivebrid_pipeline(
                         total_steps = len(ctx.steps)
 
                     current_design_idx = design_idx + (iteration * 2)
+                    await _notify_step(dashboard_client, "Opus Design", "RUNNING")
                     await step_opus_design(ctx, settings, progress_cb, step_index=current_design_idx)
+                    await _notify_step(dashboard_client, "Opus Design", "IDLE")
 
                     if cancel_event.is_set():
                         return "skipped", "Cancelled by user"
@@ -1747,9 +1794,11 @@ async def run_fivebrid_pipeline(
                     if critique_idx is not None:
                         current_critique_idx = current_design_idx + 1
                         await progress_cb(f"[{current_critique_idx}/{total_steps}] Gemini Design Critique{step_label}...")
+                        await _notify_step(dashboard_client, "Gemini Design Critique", "RUNNING")
                         await step_gemini_design_critique(
                             ctx, gemini, settings, progress_cb, step_index=current_critique_idx,
                         )
+                        await _notify_step(dashboard_client, "Gemini Design Critique", "IDLE")
 
                         critique_step = ctx.steps[current_critique_idx]
                         if critique_step.status == "revised" and "NEEDS_REVISION" in critique_step.detail:
@@ -1776,11 +1825,14 @@ async def run_fivebrid_pipeline(
             if _step_done(qwen_idx):
                 await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement (cached)")
             else:
+                await _notify_step(dashboard_client, "Qwen Hints", "RUNNING")
                 try:
                     await progress_cb(f"[{qwen_idx}/{total_steps}] Qwen Pre-Implement...")
                     await step_qwen_pre_implement(ctx, ollama, settings, progress_cb, step_index=qwen_idx)
                 except Exception as exc:
                     logger.warning("Qwen pre-implement failed (non-fatal): %s", exc)
+                finally:
+                    await _notify_step(dashboard_client, "Qwen Hints", "IDLE")
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
@@ -1794,7 +1846,9 @@ async def run_fivebrid_pipeline(
             await progress_cb(f"[{impl_idx}/{total_steps}] Sonnet Implement (cached)")
         else:
             await progress_cb(f"[{impl_idx}/{total_steps}] Sonnet Implement...")
+            await _notify_step(dashboard_client, "Sonnet Implement", "RUNNING")
             await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
+            await _notify_step(dashboard_client, "Sonnet Implement", "IDLE")
 
         # Capture snapshot ref for safe-fail recovery
         if not (resuming and ctx.impl_snapshot_ref):
@@ -1830,8 +1884,10 @@ async def run_fivebrid_pipeline(
                 await progress_cb(f"[{ci_idx}/{total_steps}] Local CI Check (cached)")
             else:
                 await progress_cb(f"[{ci_idx}/{total_steps}] Local CI Check...")
+                await _notify_step(dashboard_client, "Local CI Check", "RUNNING")
                 await step_local_ci_check(ctx, settings, progress_cb, ci_commands,
                                           step_index=ci_idx, max_retries_override=effective_ci_fix_retries)
+                await _notify_step(dashboard_client, "Local CI Check", "IDLE")
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
@@ -1843,7 +1899,9 @@ async def run_fivebrid_pipeline(
                 await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review (cached)")
             else:
                 await progress_cb(f"[{self_review_idx}/{total_steps}] Sonnet Self-Review...")
+                await _notify_step(dashboard_client, "Sonnet Self-Review", "RUNNING")
                 await step_sonnet_self_review(ctx, settings, cancel_event, progress_cb, step_index=self_review_idx)
+                await _notify_step(dashboard_client, "Sonnet Self-Review", "IDLE")
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
@@ -1857,7 +1915,9 @@ async def run_fivebrid_pipeline(
                 await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review (cached)")
             else:
                 await progress_cb(f"[{cross_review_idx}/{total_steps}] Gemini Cross-Review...")
+                await _notify_step(dashboard_client, "Gemini Cross-Review", "RUNNING")
                 await step_gemini_cross_review(ctx, gemini, settings, progress_cb, step_index=cross_review_idx)
+                await _notify_step(dashboard_client, "Gemini Cross-Review", "IDLE")
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
@@ -1887,7 +1947,9 @@ async def run_fivebrid_pipeline(
                 await progress_cb(f"[{audit_idx}/{total_steps}] AI Audit{audit_label}...")
 
                 try:
+                    await _notify_step(dashboard_client, "AI Audit", "RUNNING")
                     await step_ai_audit(ctx, ollama, settings, progress_cb, step_index=audit_idx)
+                    await _notify_step(dashboard_client, "AI Audit", "IDLE")
                     break  # PASS
                 except RuntimeError:
                     # Supreme Court: self-review PASS vs audit FAIL
@@ -1917,11 +1979,14 @@ async def run_fivebrid_pipeline(
                         )
                         ctx.review_feedback = ctx.ai_audit_result
 
+                        await _notify_step(dashboard_client, "AI Audit", "IDLE")
                         await progress_cb(f"AI Audit FAIL — Sonnet re-implementing (retry {audit_attempt + 1})...")
                         if ctx.impl_snapshot_ref:
                             await _reset_to_snapshot(ctx.project_path, ctx.impl_snapshot_ref)
 
+                        await _notify_step(dashboard_client, "Sonnet Implement", "RUNNING")
                         await step_claude_implement(ctx, settings, cancel_event, progress_cb, step_index=impl_idx)
+                        await _notify_step(dashboard_client, "Sonnet Implement", "IDLE")
                         await _snapshot_commit(ctx.project_path, ctx.issue_num)
                         ctx.git_diff = await _capture_filtered_diff(
                             ctx.project_path, base_ref=ctx.base_commit or "main",
@@ -1960,15 +2025,39 @@ async def run_fivebrid_pipeline(
                 data_mining_idx = len(ctx.steps) - 1
             try:
                 await progress_cb(f"[{data_mining_idx}/{len(ctx.steps)}] Data Mining...")
+                await _notify_step(dashboard_client, "Data Mining", "RUNNING")
                 await step_data_mining_fivebrid(ctx, ollama, settings, progress_cb, step_index=data_mining_idx)
+                await _notify_step(dashboard_client, "Data Mining", "IDLE")
             except Exception as exc:
+                await _notify_step(dashboard_client, "Data Mining", "IDLE")
                 logger.warning("Data mining step failed (non-fatal): %s", exc)
 
+        if dashboard_client:
+            try:
+                await dashboard_client.send_event("PIPELINE_COMPLETED", {
+                    "status": "success",
+                })
+                logger.debug("Dashboard: PIPELINE_COMPLETED for issue #%s", ctx.issue_num)
+            except Exception:
+                logger.warning("Failed to send PIPELINE_COMPLETED event", exc_info=True)
         return "success", "All checks passed"
 
     except asyncio.CancelledError:
         return "skipped", "Cancelled by user"
     except Exception as exc:
+        if dashboard_client:
+            failed_step = next(
+                (s.name for s in reversed(ctx.steps) if s.status == "failed"),
+                "unknown",
+            )
+            try:
+                await dashboard_client.send_event("ERROR", {
+                    "failed_step": failed_step,
+                    "error_detail": str(exc)[:200],
+                })
+                logger.debug("Dashboard: ERROR event for issue #%s — %s", ctx.issue_num, failed_step)
+            except Exception:
+                logger.warning("Failed to send ERROR event", exc_info=True)
         for s in reversed(ctx.steps):
             if s.status == "failed":
                 return "failed", f"{s.name}: {s.detail}"
