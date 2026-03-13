@@ -91,6 +91,18 @@ async def _post_init(app: Application) -> None:
     else:
         logger.warning("Gemini CLI not available — pipeline will fail on Gemini steps")
 
+    if settings.dashboard_api_url:
+        from .dashboard_client import DashboardClient
+
+        dashboard = DashboardClient(
+            base_url=settings.dashboard_api_url,
+            timeout=settings.dashboard_api_timeout,
+            api_key=settings.dashboard_api_key,
+        )
+        await dashboard.register_agents()
+        app.bot_data["dashboard"] = dashboard
+        logger.info("Dashboard client initialized: %s", settings.dashboard_api_url)
+
     # Register command menu for Telegram autocomplete
     await app.bot.set_my_commands([
         BotCommand("help", "Show available commands"),
@@ -114,7 +126,7 @@ async def _post_init(app: Application) -> None:
 
 async def _post_shutdown(app: Application) -> None:
     """Gracefully close AI provider clients."""
-    for key in ("ollama", "gemini"):
+    for key in ("ollama", "gemini", "dashboard"):
         provider = app.bot_data.get(key)
         if provider is not None:
             await provider.close()

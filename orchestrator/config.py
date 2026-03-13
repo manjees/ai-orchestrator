@@ -146,6 +146,11 @@ class Settings(BaseSettings):
     ai_audit_num_ctx: int = 32768
     ai_audit_max_retries: int = 3         # Critical 발견 시 재구현 최대 횟수 (solve_timeout이 안전장치)
 
+    # Dashboard Event Reporter
+    dashboard_api_url: str = ""
+    dashboard_api_timeout: int = 5
+    dashboard_api_key: str = ""
+
 
 def save_projects(projects: dict[str, dict]) -> None:
     """Write projects dict to projects.json, contracting home dir to ~ for portability."""
