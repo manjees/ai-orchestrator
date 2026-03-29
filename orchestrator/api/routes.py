@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from orchestrator.ai.ollama_provider import OllamaModel, OllamaProvider
@@ -295,3 +296,33 @@ async def get_checkpoints():
     raw = list_checkpoints()
     result = [CheckpointSummary(**c) for c in raw]
     return _masked_response(result)
+
+
+# ── WebSocket ───────────────────────────────────────────────────────────────
+
+
+@router.websocket("/ws/events")
+async def ws_events(ws: WebSocket):
+    """Real-time event stream for dashboard clients."""
+    from .events import get_event_bus
+
+    settings = ws.app.state.settings
+    token = ws.query_params.get("token")
+
+    if settings.dashboard_api_key:
+        if not token or not hmac.compare_digest(
+            token.encode(), settings.dashboard_api_key.encode()
+        ):
+            await ws.close(code=1008, reason="Invalid or missing token")
+            return
+
+    await ws.accept()
+    bus = get_event_bus()
+    await bus.register(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await bus.unregister(ws)

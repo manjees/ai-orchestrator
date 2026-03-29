@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 from fastapi import FastAPI
@@ -7,6 +8,7 @@ from starlette.middleware.cors import CORSMiddleware
 from orchestrator.config import Settings
 
 from .auth import APIKeyAuthMiddleware
+from .events import get_event_bus
 from .routes import router
 
 logger = logging.getLogger(__name__)
@@ -26,12 +28,20 @@ def _parse_cors_origins(raw: str) -> list[str]:
     return origins
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    bus = get_event_bus()
+    await bus.start_status_loop(interval=10.0)
+    yield
+    await bus.stop_status_loop()
+
+
 def create_api_app(
     settings: Settings,
     projects: dict[str, dict] | None = None,
     pipelines: dict | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="AI Orchestrator API")
+    app = FastAPI(title="AI Orchestrator API", lifespan=_lifespan)
     app.state.projects = projects if projects is not None else {}
     app.state.pipelines = pipelines if pipelines is not None else {}
     app.state.settings = settings
