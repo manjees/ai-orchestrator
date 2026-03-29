@@ -26,8 +26,14 @@ def _parse_cors_origins(raw: str) -> list[str]:
     return origins
 
 
-def create_api_app(settings: Settings) -> FastAPI:
+def create_api_app(
+    settings: Settings,
+    projects: dict[str, dict] | None = None,
+    pipelines: dict | None = None,
+) -> FastAPI:
     app = FastAPI(title="AI Orchestrator API")
+    app.state.projects = projects if projects is not None else {}
+    app.state.pipelines = pipelines if pipelines is not None else {}
 
     if settings.cors_origins:
         origins = _parse_cors_origins(settings.cors_origins)
