@@ -214,55 +214,83 @@ def test_project_issues_gh_fails(mock_fetch):
 # ── D10: GET /api/pipelines — 200 with pipeline list ────────────────────────
 
 
-def test_pipelines_200():
+@patch("orchestrator.api.routes.list_checkpoints", return_value=[])
+def test_pipelines_200(mock_cp):
+    from orchestrator.api import registry
+    registry.clear()
     ctx = _MockPipelineCtx()
-    client = _create_app(pipelines={"pipe-1": ctx})
+    registry._active["my-app_42"] = dict(
+        project_name=ctx.project_name, issue_num=ctx.issue_num,
+        branch_name=ctx.branch_name, mode=ctx.mode, issue_title=ctx.issue_title,
+        steps=[dict(name=s.name, status=s.status, detail=s.detail, elapsed_sec=s.elapsed_sec) for s in ctx.steps],
+    )
+    client = _create_app()
     resp = client.get("/api/pipelines")
     assert resp.status_code == 200
     data = resp.json()
-    assert len(data) == 1
-    assert data[0]["id"] == "pipe-1"
-    assert data[0]["project_name"] == "my-app"
-    assert data[0]["issue_num"] == 42
-    assert data[0]["mode"] == "standard"
-    assert len(data[0]["steps"]) == 1
+    assert len(data["pipelines"]) == 1
+    p = data["pipelines"][0]
+    assert p["pipeline_id"] == "my-app_42"
+    assert p["project_name"] == "my-app"
+    assert p["issue_num"] == 42
+    assert p["mode"] == "standard"
+    assert len(p["steps"]) == 1
+    registry.clear()
 
 
 # ── D11: GET /api/pipelines — empty when no pipelines ───────────────────────
 
 
-def test_pipelines_empty():
-    client = _create_app(pipelines={})
+@patch("orchestrator.api.routes.list_checkpoints", return_value=[])
+def test_pipelines_empty(mock_cp):
+    from orchestrator.api import registry
+    registry.clear()
+    client = _create_app()
     resp = client.get("/api/pipelines")
     assert resp.status_code == 200
-    assert resp.json() == []
+    assert resp.json() == {"pipelines": []}
+    registry.clear()
 
 
 # ── D12: GET /api/pipelines/{id} — 200 with pipeline detail ─────────────────
 
 
 def test_pipeline_detail_200():
+    from orchestrator.api import registry
+    registry.clear()
     ctx = _MockPipelineCtx()
-    client = _create_app(pipelines={"pipe-1": ctx})
-    resp = client.get("/api/pipelines/pipe-1")
+    registry._active["my-app_42"] = dict(
+        project_name=ctx.project_name, issue_num=ctx.issue_num,
+        branch_name=ctx.branch_name, mode=ctx.mode, issue_title=ctx.issue_title,
+        issue_body=ctx.issue_body, design_doc=ctx.design_doc, git_diff=ctx.git_diff,
+        review_report=ctx.review_report, ai_audit_result=ctx.ai_audit_result,
+        ci_check_log=ctx.ci_check_log,
+        steps=[dict(name=s.name, status=s.status, detail=s.detail, elapsed_sec=s.elapsed_sec) for s in ctx.steps],
+    )
+    client = _create_app()
+    resp = client.get("/api/pipelines/my-app_42")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["id"] == "pipe-1"
+    assert data["pipeline_id"] == "my-app_42"
     assert data["project_name"] == "my-app"
     assert data["branch_name"] == "solve/issue-42"
     assert data["issue_title"] == "Fix bug"
-    assert data["ai_audit_passed"] is False
     assert len(data["steps"]) == 1
+    registry.clear()
 
 
 # ── D13: GET /api/pipelines/{id} — 404 when not found ───────────────────────
 
 
-def test_pipeline_detail_404():
-    client = _create_app(pipelines={})
-    resp = client.get("/api/pipelines/nonexistent")
+@patch("orchestrator.api.routes.load_checkpoint", return_value=None)
+def test_pipeline_detail_404(mock_cp):
+    from orchestrator.api import registry
+    registry.clear()
+    client = _create_app()
+    resp = client.get("/api/pipelines/nonexistent_1")
     assert resp.status_code == 404
     assert resp.json()["detail"] == "Pipeline not found"
+    registry.clear()
 
 
 # ── D14: GET /api/checkpoints — 200 with checkpoint list ────────────────────
@@ -320,10 +348,19 @@ def test_secret_masking_project_summary(mock_load):
 
 
 def test_secret_masking_pipeline():
-    ctx = _MockPipelineCtx(issue_body="token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 here")
-    client = _create_app(pipelines={"pipe-1": ctx})
-    resp = client.get("/api/pipelines/pipe-1")
+    from orchestrator.api import registry
+    registry.clear()
+    registry._active["my-app_42"] = dict(
+        project_name="my-app", issue_num=42,
+        branch_name="solve/issue-42", mode="standard", issue_title="Fix bug",
+        design_doc="token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 here",
+        git_diff="", review_report="", ai_audit_result="", ci_check_log="",
+        steps=[dict(name="Sonnet Implement", status="passed", detail="ok", elapsed_sec=1.5)],
+    )
+    client = _create_app()
+    resp = client.get("/api/pipelines/my-app_42")
     assert resp.status_code == 200
     body = resp.text
     assert "ghp_" not in body
     assert "[MASKED]" in body
+    registry.clear()

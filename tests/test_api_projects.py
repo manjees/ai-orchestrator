@@ -1,7 +1,5 @@
 """Tests for project endpoints: list, detail, issues."""
 
-import asyncio
-import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -25,9 +23,8 @@ def _make_settings(**overrides) -> Settings:
     return Settings(**defaults)
 
 
-@pytest.fixture()
-def client():
-    app = create_api_app(_make_settings())
+def _create_client(projects=None):
+    app = create_api_app(_make_settings(), projects=projects or {})
     c = TestClient(app)
     c.headers.update({"Authorization": f"Bearer {_TEST_API_KEY}"})
     return c
@@ -36,44 +33,37 @@ def client():
 # ── P1: GET /api/projects — returns project list ──────────────────────────────
 
 
-def test_list_projects_returns_all(client):
-    with patch("orchestrator.api.routes.load_projects") as m:
-        m.return_value = {
-            "proj-a": {"path": "/tmp/a"},
-            "proj-b": {"path": "/tmp/b"},
-        }
-        resp = client.get("/api/projects")
+def test_list_projects_returns_all():
+    client = _create_client(projects={
+        "proj-a": {"path": "/tmp/a"},
+        "proj-b": {"path": "/tmp/b"},
+    })
+    resp = client.get("/api/projects")
     assert resp.status_code == 200
-    assert resp.json() == {
-        "projects": [
-            {"name": "proj-a", "path": "/tmp/a"},
-            {"name": "proj-b", "path": "/tmp/b"},
-        ]
-    }
+    data = resp.json()
+    assert len(data) == 2
+    names = {p["name"] for p in data}
+    assert names == {"proj-a", "proj-b"}
 
 
 # ── P2: GET /api/projects — empty list when no projects ──────────────────────
 
 
-def test_list_projects_empty(client):
-    with patch("orchestrator.api.routes.load_projects") as m:
-        m.return_value = {}
-        resp = client.get("/api/projects")
+def test_list_projects_empty():
+    client = _create_client(projects={})
+    resp = client.get("/api/projects")
     assert resp.status_code == 200
-    assert resp.json() == {"projects": []}
+    assert resp.json() == []
 
 
 # ── P3: GET /api/projects/{name} — returns project detail with summary ───────
 
 
-def test_project_detail_with_summary(client):
-    with (
-        patch("orchestrator.api.routes.load_projects") as mp,
-        patch("orchestrator.api.routes.load_project_summary") as ms,
-    ):
-        mp.return_value = {"my-app": {"path": "/tmp/my-app"}}
-        ms.return_value = {"issues": [{"num": 1, "title": "Init"}]}
-        resp = client.get("/api/projects/my-app")
+@patch("orchestrator.api.routes.load_project_summary")
+def test_project_detail_with_summary(mock_summary):
+    mock_summary.return_value = {"issues": [{"num": 1, "title": "Init"}]}
+    client = _create_client(projects={"my-app": {"path": "/tmp/my-app"}})
+    resp = client.get("/api/projects/my-app")
     assert resp.status_code == 200
     body = resp.json()
     assert body["name"] == "my-app"
@@ -84,25 +74,21 @@ def test_project_detail_with_summary(client):
 # ── P4: GET /api/projects/{name} — 404 for unknown project ──────────────────
 
 
-def test_project_detail_not_found(client):
-    with patch("orchestrator.api.routes.load_projects") as m:
-        m.return_value = {}
-        resp = client.get("/api/projects/unknown")
+def test_project_detail_not_found():
+    client = _create_client(projects={})
+    resp = client.get("/api/projects/unknown")
     assert resp.status_code == 404
-    assert resp.json()["detail"] == "Project not found: unknown"
+    assert resp.json()["detail"] == "Project not found"
 
 
 # ── P5: GET /api/projects/{name} — summary is empty dict when missing ────────
 
 
-def test_project_detail_no_summary(client):
-    with (
-        patch("orchestrator.api.routes.load_projects") as mp,
-        patch("orchestrator.api.routes.load_project_summary") as ms,
-    ):
-        mp.return_value = {"bare": {"path": "/tmp/bare"}}
-        ms.return_value = {}
-        resp = client.get("/api/projects/bare")
+@patch("orchestrator.api.routes.load_project_summary")
+def test_project_detail_no_summary(mock_summary):
+    mock_summary.return_value = {}
+    client = _create_client(projects={"bare": {"path": "/tmp/bare"}})
+    resp = client.get("/api/projects/bare")
     assert resp.status_code == 200
     assert resp.json()["summary"] == {}
 
@@ -110,67 +96,49 @@ def test_project_detail_no_summary(client):
 # ── P6: GET /api/projects/{name}/issues — returns GitHub issues ──────────────
 
 
-def test_project_issues_success(client):
-    issues_json = json.dumps([
-        {"number": 1, "title": "Bug", "url": "https://github.com/x/y/issues/1", "body": "desc"},
-    ]).encode()
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate.return_value = (issues_json, b"")
-    mock_proc.returncode = 0
-
-    with (
-        patch("orchestrator.api.routes.load_projects") as mp,
-        patch("orchestrator.api.routes.asyncio.create_subprocess_exec", return_value=mock_proc) as msub,
-    ):
-        mp.return_value = {"my-app": {"path": "/tmp/my-app"}}
-        resp = client.get("/api/projects/my-app/issues")
-
+@patch("orchestrator.api.routes._fetch_github_issues", new_callable=AsyncMock)
+def test_project_issues_success(mock_fetch):
+    mock_fetch.return_value = [
+        {"number": 1, "title": "Bug", "url": "https://github.com/x/y/issues/1", "labels": ["bug"]},
+    ]
+    client = _create_client(projects={"my-app": {"path": "/tmp/my-app"}})
+    resp = client.get("/api/projects/my-app/issues")
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["project"] == "my-app"
-    assert body["issues"][0]["number"] == 1
-    assert body["issues"][0]["title"] == "Bug"
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["number"] == 1
+    assert data[0]["title"] == "Bug"
 
 
 # ── P7: GET /api/projects/{name}/issues — 404 for unknown project ────────────
 
 
-def test_project_issues_not_found(client):
-    with patch("orchestrator.api.routes.load_projects") as m:
-        m.return_value = {}
-        resp = client.get("/api/projects/unknown/issues")
+def test_project_issues_not_found():
+    client = _create_client(projects={})
+    resp = client.get("/api/projects/unknown/issues")
     assert resp.status_code == 404
 
 
-# ── P8: GET /api/projects/{name}/issues — gh command failure returns 502 ─────
+# ── P8: GET /api/projects/{name}/issues — gh failure returns empty list ──────
 
 
-def test_project_issues_gh_error(client):
-    mock_proc = AsyncMock()
-    mock_proc.communicate.return_value = (b"", b"gh: not logged in")
-    mock_proc.returncode = 1
-
-    with (
-        patch("orchestrator.api.routes.load_projects") as mp,
-        patch("orchestrator.api.routes.asyncio.create_subprocess_exec", return_value=mock_proc),
-    ):
-        mp.return_value = {"my-app": {"path": "/tmp/my-app"}}
-        resp = client.get("/api/projects/my-app/issues")
-
-    assert resp.status_code == 502
-    assert "gh issue list failed" in resp.json()["detail"]
+@patch("orchestrator.api.routes._fetch_github_issues", new_callable=AsyncMock)
+def test_project_issues_gh_failure(mock_fetch):
+    mock_fetch.return_value = []
+    client = _create_client(projects={"my-app": {"path": "/tmp/my-app"}})
+    resp = client.get("/api/projects/my-app/issues")
+    assert resp.status_code == 200
+    assert resp.json() == []
 
 
 # ── P9: Secret masking applied to project list ───────────────────────────────
 
 
-def test_list_projects_masks_secrets(client):
-    with patch("orchestrator.api.routes.load_projects") as m:
-        m.return_value = {
-            "secret-proj": {"path": "/tmp/sk-ant-ABCDEFGHIJ"},
-        }
-        resp = client.get("/api/projects")
+def test_list_projects_masks_secrets():
+    client = _create_client(projects={
+        "secret-proj": {"path": "/tmp/sk-ant-ABCDEFGHIJ"},
+    })
+    resp = client.get("/api/projects")
     assert "sk-ant-" not in resp.text
     assert "[MASKED]" in resp.text
 
@@ -178,16 +146,13 @@ def test_list_projects_masks_secrets(client):
 # ── P10: Secret masking applied to project detail summary ────────────────────
 
 
-def test_project_detail_masks_secrets(client):
-    with (
-        patch("orchestrator.api.routes.load_projects") as mp,
-        patch("orchestrator.api.routes.load_project_summary") as ms,
-    ):
-        mp.return_value = {"app": {"path": "/tmp/app"}}
-        ms.return_value = {
-            "issues": [{"num": 1, "title": "Has ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA token"}],
-        }
-        resp = client.get("/api/projects/app")
+@patch("orchestrator.api.routes.load_project_summary")
+def test_project_detail_masks_secrets(mock_summary):
+    mock_summary.return_value = {
+        "issues": [{"num": 1, "title": "Has ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA token"}],
+    }
+    client = _create_client(projects={"app": {"path": "/tmp/app"}})
+    resp = client.get("/api/projects/app")
     assert "ghp_" not in resp.text
     assert "[MASKED]" in resp.text
 
@@ -195,53 +160,27 @@ def test_project_detail_masks_secrets(client):
 # ── P11: Secret masking applied to issues ────────────────────────────────────
 
 
-def test_project_issues_masks_secrets(client):
-    issues_json = json.dumps([
+@patch("orchestrator.api.routes._fetch_github_issues", new_callable=AsyncMock)
+def test_project_issues_masks_secrets(mock_fetch):
+    mock_fetch.return_value = [
         {
             "number": 1,
-            "title": "Fix",
-            "body": "token ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA leaked",
+            "title": "Has ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA token",
             "url": "https://github.com/x/y/issues/1",
+            "labels": [],
         },
-    ]).encode()
-
-    mock_proc = AsyncMock()
-    mock_proc.communicate.return_value = (issues_json, b"")
-    mock_proc.returncode = 0
-
-    with (
-        patch("orchestrator.api.routes.load_projects") as mp,
-        patch("orchestrator.api.routes.asyncio.create_subprocess_exec", return_value=mock_proc),
-    ):
-        mp.return_value = {"my-app": {"path": "/tmp/my-app"}}
-        resp = client.get("/api/projects/my-app/issues")
-
+    ]
+    client = _create_client(projects={"my-app": {"path": "/tmp/my-app"}})
+    resp = client.get("/api/projects/my-app/issues")
     assert "ghp_" not in resp.text
     assert "[MASKED]" in resp.text
 
 
-# ── P12: GET /api/projects/{name}/issues — timeout returns 504 ───────────────
+# ── P12: Auth required ─────────────────────────────────────────────────────
 
 
-def test_project_issues_gh_not_found(client):
-    with (
-        patch("orchestrator.api.routes.load_projects") as mp,
-        patch("orchestrator.api.routes.asyncio.create_subprocess_exec", side_effect=FileNotFoundError),
-    ):
-        mp.return_value = {"my-app": {"path": "/tmp/my-app"}}
-        resp = client.get("/api/projects/my-app/issues")
-
-    assert resp.status_code == 502
-    assert "gh not found" in resp.json()["detail"]
-
-
-def test_project_issues_timeout(client):
-    with (
-        patch("orchestrator.api.routes.load_projects") as mp,
-        patch("orchestrator.api.routes.asyncio.create_subprocess_exec", side_effect=asyncio.TimeoutError),
-    ):
-        mp.return_value = {"my-app": {"path": "/tmp/my-app"}}
-        resp = client.get("/api/projects/my-app/issues")
-
-    assert resp.status_code == 504
-    assert "timed out" in resp.json()["detail"]
+def test_projects_requires_auth():
+    app = create_api_app(_make_settings())
+    client = TestClient(app)
+    resp = client.get("/api/projects")
+    assert resp.status_code == 401

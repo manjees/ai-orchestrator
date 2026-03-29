@@ -250,11 +250,11 @@ async def list_pipelines():
     """Return active + recently completed pipelines."""
     pipelines: list[PipelineSummary] = []
 
-    # 1. Active pipelines from registry
+    # Live pipelines take priority so the UI always shows latest state
     for pid, ctx_data in registry.list_all().items():
         pipelines.append(_build_summary(ctx_data, pid))
 
-    # 2. Completed/failed pipelines from checkpoints
+    # Backfill from checkpoints so completed/failed runs remain visible
     for cp_meta in list_checkpoints():
         pid = f"{cp_meta['project_name']}_{cp_meta['issue_num']}"
         if any(p.pipeline_id == pid for p in pipelines):
@@ -269,12 +269,12 @@ async def list_pipelines():
 @router.get("/pipelines/{pipeline_id}", response_model=PipelineDetail)
 async def get_pipeline(pipeline_id: str):
     """Return pipeline detail by ID ({project_name}_{issue_num})."""
-    # 1. Check active registry
+    # Prefer live registry data — it reflects real-time step progress
     ctx_data = registry.get(pipeline_id)
     if ctx_data:
         return _build_detail(ctx_data, pipeline_id)
 
-    # 2. Check checkpoints
+    # Fall back to checkpoint for completed/failed pipelines no longer in memory
     parts = pipeline_id.rsplit("_", 1)
     if len(parts) == 2:
         project_name, issue_str = parts
@@ -290,7 +290,7 @@ async def get_pipeline(pipeline_id: str):
     return JSONResponse(status_code=404, content={"detail": "Pipeline not found"})
 
 
-@router.get("/checkpoints")
+@router.get("/checkpoints", response_model=list[CheckpointSummary])
 async def get_checkpoints():
     raw = list_checkpoints()
     result = [CheckpointSummary(**c) for c in raw]
