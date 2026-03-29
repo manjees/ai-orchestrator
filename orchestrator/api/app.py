@@ -34,6 +34,7 @@ def create_api_app(
     app = FastAPI(title="AI Orchestrator API")
     app.state.projects = projects if projects is not None else {}
     app.state.pipelines = pipelines if pipelines is not None else {}
+    app.state.settings = settings
 
     if settings.cors_origins:
         origins = _parse_cors_origins(settings.cors_origins)
