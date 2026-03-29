@@ -5,6 +5,11 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 
+class OllamaModelInfo(BaseModel):
+    name: str
+    size_gb: float
+
+
 class TmuxSessionResponse(BaseModel):
     name: str
     windows: int
@@ -20,6 +25,7 @@ class StatusResponse(BaseModel):
     disk_total_gb: float
     disk_used_gb: float
     disk_percent: float
+    ollama_models: list[OllamaModelInfo]
     tmux_sessions: list[TmuxSessionResponse]
 
 

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from orchestrator.ai.ollama_provider import OllamaModel, OllamaProvider
 from orchestrator.checkpoint import list_checkpoints
 from orchestrator.security import mask_secrets
 from orchestrator.state_sync import load_project_summary
@@ -17,6 +19,7 @@ from orchestrator.tmux_manager import list_sessions
 from .models import (
     CheckpointSummary,
     GithubIssue,
+    OllamaModelInfo,
     PipelineDetail,
     PipelineStepResponse,
     PipelineSummary,
@@ -25,6 +28,8 @@ from .models import (
     StatusResponse,
     TmuxSessionResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
 
@@ -68,14 +73,46 @@ async def health():
     return {"status": "ok"}
 
 
+async def _get_ollama_models(base_url: str) -> list[OllamaModel]:
+    provider = OllamaProvider(base_url=base_url, model="")
+    try:
+        return await provider.get_loaded_models()
+    finally:
+        await provider.close()
+
+
+async def _safe_list_sessions() -> list:
+    """Fetch tmux sessions, returning [] on failure."""
+    try:
+        return await list_sessions()
+    except Exception:
+        logger.warning("Failed to list tmux sessions", exc_info=True)
+        return []
+
+
+async def _safe_get_ollama_models(base_url: str) -> list[OllamaModel]:
+    """Fetch ollama models, returning [] on failure."""
+    try:
+        return await _get_ollama_models(base_url)
+    except Exception:
+        logger.warning("Failed to get ollama models", exc_info=True)
+        return []
+
+
 @router.get("/status")
-async def get_status():
-    sys_status, tmux_sessions = await asyncio.gather(
-        get_system_status(), list_sessions(),
+async def get_status(request: Request):
+    settings = request.app.state.settings
+
+    sys_status = await get_system_status()
+
+    sessions, models = await asyncio.gather(
+        _safe_list_sessions(),
+        _safe_get_ollama_models(settings.ollama_base_url),
     )
+
     tmux_resp = [
         TmuxSessionResponse(name=s.name, windows=s.windows, created=str(s.created))
-        for s in tmux_sessions
+        for s in sessions
     ]
     resp = StatusResponse(
         ram_total_gb=sys_status.ram_total_gb,
@@ -86,6 +123,7 @@ async def get_status():
         disk_total_gb=sys_status.disk_total_gb,
         disk_used_gb=sys_status.disk_used_gb,
         disk_percent=sys_status.disk_percent,
+        ollama_models=[OllamaModelInfo(name=m.name, size_gb=m.size_gb) for m in models],
         tmux_sessions=tmux_resp,
     )
     return _masked_response(resp)
