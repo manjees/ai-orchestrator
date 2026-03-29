@@ -10,7 +10,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from orchestrator.ai.ollama_provider import OllamaModel, OllamaProvider
-from orchestrator.checkpoint import list_checkpoints
+from orchestrator.api import registry
+from orchestrator.checkpoint import list_checkpoints, load_checkpoint
 from orchestrator.security import mask_secrets
 from orchestrator.state_sync import load_project_summary
 from orchestrator.system_monitor import get_system_status
@@ -21,6 +22,7 @@ from .models import (
     GithubIssue,
     OllamaModelInfo,
     PipelineDetail,
+    PipelineListResponse,
     PipelineStepResponse,
     PipelineSummary,
     ProjectDetail,
@@ -62,6 +64,82 @@ async def _fetch_github_issues(project_path: str) -> list[dict]:
     except Exception:
         pass
     return []
+
+
+def _derive_status(steps: list[dict]) -> str:
+    """Derive pipeline status from step statuses."""
+    statuses = [s.get("status", "pending") for s in steps]
+    if "running" in statuses:
+        return "running"
+    if "failed" in statuses:
+        return "failed"
+    if all(s in ("passed", "skipped") for s in statuses) and statuses:
+        return "completed"
+    return "pending"
+
+
+def _mask_dict_strings(d: dict) -> dict:
+    """Recursively apply mask_secrets() to all string values."""
+    result = {}
+    for k, v in d.items():
+        if isinstance(v, str):
+            result[k] = mask_secrets(v)
+        elif isinstance(v, dict):
+            result[k] = _mask_dict_strings(v)
+        elif isinstance(v, list):
+            result[k] = [
+                _mask_dict_strings(item) if isinstance(item, dict)
+                else mask_secrets(item) if isinstance(item, str)
+                else item
+                for item in v
+            ]
+        else:
+            result[k] = v
+    return result
+
+
+def _build_summary(ctx_data: dict, pid: str) -> PipelineSummary:
+    """Build a PipelineSummary from a ctx dict. Status derived from steps."""
+    steps_raw = ctx_data.get("steps", [])
+    masked = _mask_dict_strings(ctx_data)
+    return PipelineSummary(
+        pipeline_id=pid,
+        project_name=masked.get("project_name", ""),
+        issue_num=ctx_data.get("issue_num", 0),
+        status=_derive_status(steps_raw),
+        mode=masked.get("mode", "standard"),
+        issue_title=masked.get("issue_title", ""),
+        branch_name=masked.get("branch_name", ""),
+        steps=[PipelineStepResponse(**s) for s in masked.get("steps", [])],
+    )
+
+
+def _build_detail(ctx_data: dict, pid: str) -> PipelineDetail:
+    """Build full PipelineDetail from a ctx dict."""
+    steps_raw = ctx_data.get("steps", [])
+    masked = _mask_dict_strings(ctx_data)
+    return PipelineDetail(
+        pipeline_id=pid,
+        project_name=masked.get("project_name", ""),
+        issue_num=ctx_data.get("issue_num", 0),
+        status=_derive_status(steps_raw),
+        mode=masked.get("mode", "standard"),
+        issue_title=masked.get("issue_title", ""),
+        branch_name=masked.get("branch_name", ""),
+        steps=[PipelineStepResponse(**s) for s in masked.get("steps", [])],
+        design_doc=masked.get("design_doc", ""),
+        git_diff=masked.get("git_diff", ""),
+        review_report=masked.get("review_report", ""),
+        audit_result=masked.get("audit_result", ""),
+        ai_audit_result=masked.get("ai_audit_result", ""),
+        self_review_report=masked.get("self_review_report", ""),
+        gemini_cross_review=masked.get("gemini_cross_review", ""),
+        gemini_design_critique=masked.get("gemini_design_critique", ""),
+        research_log=masked.get("research_log", ""),
+        ci_check_log=masked.get("ci_check_log", ""),
+        triage_reason=masked.get("triage_reason", ""),
+        retry_count=ctx_data.get("retry_count", 0),
+    )
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -167,44 +245,49 @@ async def get_project_issues(name: str, request: Request):
     return _masked_response(result)
 
 
-@router.get("/pipelines")
-async def get_pipelines(request: Request):
-    pipelines = getattr(request.app.state, "pipelines", {})
-    result = []
-    for p_id, ctx in pipelines.items():
-        steps = [
-            PipelineStepResponse(
-                name=s.name, status=s.status, detail=s.detail, elapsed_sec=s.elapsed_sec,
-            )
-            for s in ctx.steps
-        ]
-        result.append(PipelineSummary(
-            id=p_id, project_name=ctx.project_name, issue_num=ctx.issue_num,
-            mode=ctx.mode, steps=steps,
-        ))
-    return _masked_response(result)
+@router.get("/pipelines", response_model=PipelineListResponse)
+async def list_pipelines():
+    """Return active + recently completed pipelines."""
+    pipelines: list[PipelineSummary] = []
+
+    # 1. Active pipelines from registry
+    for pid, ctx_data in registry.list_all().items():
+        pipelines.append(_build_summary(ctx_data, pid))
+
+    # 2. Completed/failed pipelines from checkpoints
+    for cp_meta in list_checkpoints():
+        pid = f"{cp_meta['project_name']}_{cp_meta['issue_num']}"
+        if any(p.pipeline_id == pid for p in pipelines):
+            continue
+        cp_data = load_checkpoint(cp_meta["project_name"], cp_meta["issue_num"])
+        if cp_data and "ctx" in cp_data:
+            pipelines.append(_build_summary(cp_data["ctx"], pid))
+
+    return PipelineListResponse(pipelines=pipelines)
 
 
-@router.get("/pipelines/{pipeline_id}")
-async def get_pipeline(pipeline_id: str, request: Request):
-    pipelines = getattr(request.app.state, "pipelines", {})
-    if pipeline_id not in pipelines:
-        raise HTTPException(status_code=404, detail="Pipeline not found")
-    ctx = pipelines[pipeline_id]
-    steps = [
-        PipelineStepResponse(
-            name=s.name, status=s.status, detail=s.detail, elapsed_sec=s.elapsed_sec,
-        )
-        for s in ctx.steps
-    ]
-    return _masked_response(PipelineDetail(
-        id=pipeline_id, project_name=ctx.project_name, issue_num=ctx.issue_num,
-        branch_name=ctx.branch_name, mode=ctx.mode, issue_title=ctx.issue_title,
-        issue_body=ctx.issue_body, design_doc=ctx.design_doc, git_diff=ctx.git_diff,
-        ci_check_log=ctx.ci_check_log, review_report=ctx.review_report,
-        ai_audit_result=ctx.ai_audit_result, ai_audit_passed=ctx.ai_audit_passed,
-        steps=steps,
-    ))
+@router.get("/pipelines/{pipeline_id}", response_model=PipelineDetail)
+async def get_pipeline(pipeline_id: str):
+    """Return pipeline detail by ID ({project_name}_{issue_num})."""
+    # 1. Check active registry
+    ctx_data = registry.get(pipeline_id)
+    if ctx_data:
+        return _build_detail(ctx_data, pipeline_id)
+
+    # 2. Check checkpoints
+    parts = pipeline_id.rsplit("_", 1)
+    if len(parts) == 2:
+        project_name, issue_str = parts
+        try:
+            issue_num = int(issue_str)
+        except ValueError:
+            pass
+        else:
+            cp_data = load_checkpoint(project_name, issue_num)
+            if cp_data and "ctx" in cp_data:
+                return _build_detail(cp_data["ctx"], pipeline_id)
+
+    return JSONResponse(status_code=404, content={"detail": "Pipeline not found"})
 
 
 @router.get("/checkpoints")
