@@ -151,6 +151,10 @@ class Settings(BaseSettings):
     dashboard_api_timeout: int = 5
     dashboard_api_key: str = ""
 
+    # Dashboard API Server
+    api_port: int = 9000
+    cors_origins: str = ""  # Comma-separated, e.g. "http://localhost:3000"
+
 
 def save_projects(projects: dict[str, dict]) -> None:
     """Write projects dict to projects.json, contracting home dir to ~ for portability."""
