@@ -30,7 +30,6 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api")
 
 
