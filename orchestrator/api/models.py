@@ -49,34 +49,41 @@ class GithubIssue(BaseModel):
 
 class PipelineStepResponse(BaseModel):
     name: str
-    status: str
-    detail: str
-    elapsed_sec: float
+    status: str  # pending | running | passed | failed | skipped
+    detail: str = ""
+    elapsed_sec: float = 0.0
 
 
 class PipelineSummary(BaseModel):
-    id: str
+    pipeline_id: str  # "{project_name}_{issue_num}"
     project_name: str
     issue_num: int
-    mode: str
-    steps: list[PipelineStepResponse]
+    status: str  # pending | running | completed | failed
+    mode: str = "standard"  # express | standard | full
+    issue_title: str = ""
+    branch_name: str = ""
+    steps: list[PipelineStepResponse] = []
 
 
-class PipelineDetail(BaseModel):
-    id: str
-    project_name: str
-    issue_num: int
-    branch_name: str
-    mode: str
-    issue_title: str
-    issue_body: str
-    design_doc: str
-    git_diff: str
-    ci_check_log: str
-    review_report: str
-    ai_audit_result: str
-    ai_audit_passed: bool
-    steps: list[PipelineStepResponse]
+class PipelineDetail(PipelineSummary):
+    """Full detail — extends summary with large text fields (masked)."""
+
+    design_doc: str = ""
+    git_diff: str = ""
+    review_report: str = ""
+    audit_result: str = ""
+    ai_audit_result: str = ""
+    self_review_report: str = ""
+    gemini_cross_review: str = ""
+    gemini_design_critique: str = ""
+    research_log: str = ""
+    ci_check_log: str = ""
+    triage_reason: str = ""
+    retry_count: int = 0
+
+
+class PipelineListResponse(BaseModel):
+    pipelines: list[PipelineSummary]
 
 
 class CheckpointSummary(BaseModel):

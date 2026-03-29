@@ -41,6 +41,7 @@ from .pipeline import (
     step_discuss_to_issues,
     step_triage_and_split,
 )
+from .api import registry
 from .security import mask_secrets
 from .system_monitor import get_system_status
 from .tmux_manager import capture_pane, list_sessions
@@ -904,6 +905,10 @@ async def _solve_issues(
     except Exception:
         logger.exception("Solve loop error")
     finally:
+        # Unregister pipelines from the API registry
+        for num in issue_nums:
+            registry.unregister(project_name, num)
+
         # Decrement active count; remove only this batch's cancel events
         count = _solve_active.get(chat_id, 1) - 1
         if count <= 0:
@@ -1040,6 +1045,10 @@ async def _solve_issues_staggered(
     except Exception:
         logger.exception("Staggered solve error")
     finally:
+        # Unregister pipelines from the API registry
+        for num in issue_nums:
+            registry.unregister(project_name, num)
+
         count = _solve_active.get(chat_id, 1) - 1
         if count <= 0:
             _solve_active.pop(chat_id, None)
@@ -1244,6 +1253,7 @@ async def _solve_with_fivebrid(
             branch_name=branch_name,
             base_commit=base_commit,
         )
+        registry.register(ctx)
 
         # Progress callback
         async def progress_cb(status_text: str) -> None:
@@ -1366,6 +1376,7 @@ async def _solve_with_fivebrid(
             supreme_court_cb=supreme_court_cb,
             dashboard_client=dashboard_client,
         )
+        registry.update(ctx)
 
         elapsed = int(time.monotonic() - pipeline_start)
         mins, secs = divmod(elapsed, 60)
@@ -2998,6 +3009,7 @@ async def _retry_from_checkpoint(
         # Restore context
         ctx = restore_context(checkpoint)
         ctx.project_path = worktree_dir
+        registry.register(ctx)
 
         # Reset the failed step to pending so it gets re-run
         for s in ctx.steps:
@@ -3036,6 +3048,7 @@ async def _retry_from_checkpoint(
             project_info=project_info,
             resume_from_step=failed_idx,
         )
+        registry.update(ctx)
 
         elapsed = int(time.monotonic() - pipeline_start)
         mins, secs = divmod(elapsed, 60)
@@ -3093,6 +3106,7 @@ async def _retry_from_checkpoint(
         logger.exception("Error in retry for issue #%d", issue_num)
         await _edit_msg(msg, f"<b>#{issue_num}</b> — Retry error: {html.escape(str(exc)[:200])}")
     finally:
+        registry.unregister(project_name, issue_num)
         if worktree_dir:
             await _save_checkpoint_on_failure(ctx, worktree_dir, project_name, issue_num, pipeline_mode)
             await _cleanup_worktree(project_path, worktree_dir, branch_name)
