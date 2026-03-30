@@ -50,6 +50,12 @@ _STEP_AGENT_MAP: dict[str, str] = {
 async def _notify_step(
     dashboard_client: "DashboardClient | None", step_name: str, status: str,
 ) -> None:
+    # Emit WebSocket events for step transitions
+    if status == "RUNNING":
+        await _emit_event("step.started", {"step_name": step_name})
+    elif status == "IDLE":
+        await _emit_event("step.completed", {"step_name": step_name, "status": "passed"})
+
     if dashboard_client is None:
         return
     agent_id = _STEP_AGENT_MAP.get(step_name)
@@ -60,6 +66,15 @@ async def _notify_step(
         await dashboard_client.update_agent_status(agent_id, status)
     except Exception:
         logger.warning("Failed to notify dashboard for %s → %s", agent_id, status, exc_info=True)
+
+
+async def _emit_event(event_type: str, data: dict) -> None:
+    """Fire-and-forget event to WebSocket clients."""
+    try:
+        from orchestrator.api.events import get_event_bus
+        await get_event_bus().emit(event_type, data)
+    except Exception:
+        pass  # Never block pipeline for WS events
 
 
 @dataclass
@@ -1724,6 +1739,14 @@ async def run_fivebrid_pipeline(
             except Exception:
                 logger.warning("Failed to send PIPELINE_STARTED event", exc_info=True)
 
+        pipeline_id = f"{ctx.project_name}_{ctx.issue_num}"
+        await _emit_event("pipeline.started", {
+            "pipeline_id": pipeline_id,
+            "project_name": ctx.project_name,
+            "issue_num": ctx.issue_num,
+            "mode": ctx.mode,
+        })
+
         # Fetch issue (skip if already populated by triage or checkpoint)
         if ctx.issue_body:
             if resuming:
@@ -2040,6 +2063,7 @@ async def run_fivebrid_pipeline(
                 logger.debug("Dashboard: PIPELINE_COMPLETED for issue #%s", ctx.issue_num)
             except Exception:
                 logger.warning("Failed to send PIPELINE_COMPLETED event", exc_info=True)
+        await _emit_event("pipeline.completed", {"pipeline_id": pipeline_id})
         return "success", "All checks passed"
 
     except asyncio.CancelledError:
@@ -2058,6 +2082,14 @@ async def run_fivebrid_pipeline(
                 logger.debug("Dashboard: ERROR event for issue #%s — %s", ctx.issue_num, failed_step)
             except Exception:
                 logger.warning("Failed to send ERROR event", exc_info=True)
+        ws_failed_step = next(
+            (s.name for s in reversed(ctx.steps) if s.status == "failed"),
+            "unknown",
+        )
+        await _emit_event("pipeline.failed", {
+            "pipeline_id": pipeline_id,
+            "failed_step": ws_failed_step,
+        })
         for s in reversed(ctx.steps):
             if s.status == "failed":
                 return "failed", f"{s.name}: {s.detail}"
