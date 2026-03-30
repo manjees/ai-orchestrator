@@ -92,3 +92,15 @@ class CheckpointSummary(BaseModel):
     issue_num: int
     pipeline_mode: str
     failed_step_name: str
+
+
+class PipelineHistoryEntry(BaseModel):
+    timestamp: str
+    event_type: str
+    pipeline_id: str
+    project_name: str
+    data: dict = {}
+
+
+class PipelineHistoryResponse(BaseModel):
+    history: list[PipelineHistoryEntry]

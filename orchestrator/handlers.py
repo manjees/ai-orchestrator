@@ -32,6 +32,7 @@ from .config import PIPELINE_MODES
 from .pipeline import (
     InitContext,
     PipelineContext,
+    _emit_event,
     format_intent_summary,
     format_pipeline_summary,
     run_fivebrid_pipeline,
@@ -1271,6 +1272,11 @@ async def _solve_with_fivebrid(
                 f"[{time_str}] {sys_line}"
             )
             await _edit_msg(msg, text, reply_markup=cancel_btn)
+            await _emit_event("pipeline.progress", {
+                "pipeline_id": f"{project_name}_{issue_num}",
+                "project_name": project_name,
+                "status_text": status_text,
+            })
 
         # ── Triage & Split ──
         triage_result = await step_triage_and_split(ctx, settings, progress_cb)
@@ -3036,6 +3042,11 @@ async def _retry_from_checkpoint(
                 f"[{time_str}] {sys_line}"
             )
             await _edit_msg(msg, text, reply_markup=cancel_btn)
+            await _emit_event("pipeline.progress", {
+                "pipeline_id": f"{project_name}_{issue_num}",
+                "project_name": project_name,
+                "status_text": status_text,
+            })
 
         # Run resumed pipeline
         ollama: OllamaProvider | None = context.bot_data.get("ollama")

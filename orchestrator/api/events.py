@@ -71,6 +71,15 @@ class EventBus:
                 for ws in dead:
                     self._clients.discard(ws)
 
+        # JSONL logging (fire-and-forget, sync write in executor)
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, get_event_logger().append, event_type, data or {},
+            )
+        except Exception:
+            logger.warning("JSONL append failed", exc_info=True)
+
     @property
     def client_count(self) -> int:
         return len(self._clients)
@@ -104,6 +113,11 @@ class EventBus:
 
 
 # Lazy imports to avoid circular dependencies
+def get_event_logger():
+    from orchestrator.event_logger import get_event_logger as _get
+    return _get()
+
+
 def get_system_status():
     from orchestrator.system_monitor import get_system_status as _get
     return _get()

@@ -267,6 +267,14 @@ async def list_pipelines():
     return PipelineListResponse(pipelines=pipelines)
 
 
+@router.get("/pipelines/history")
+async def get_pipeline_history(limit: int = 20):
+    """Return recent pipeline runs from JSONL event log."""
+    from orchestrator.event_logger import get_event_logger
+    history = get_event_logger().read_pipeline_history(limit=min(limit, 100))
+    return {"history": history}
+
+
 @router.get("/pipelines/{pipeline_id}", response_model=PipelineDetail)
 async def get_pipeline(pipeline_id: str):
     """Return pipeline detail by ID ({project_name}_{issue_num})."""
