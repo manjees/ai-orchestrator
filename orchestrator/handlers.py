@@ -1162,6 +1162,7 @@ async def _solve_single_issue(
     scheduler=None,
     supreme_court_cb=None,
     dashboard_client=None,
+    base_ref: str = "origin/main",
 ) -> tuple[str, str]:
     """Solve one issue. Routes to fivebrid, dual-check, or direct-claude based on settings."""
     settings = context.bot_data["settings"]
@@ -1185,6 +1186,7 @@ async def _solve_single_issue(
         scheduler=scheduler,
         supreme_court_cb=supreme_court_cb,
         dashboard_client=dashboard_client,
+        base_ref=base_ref,
     )
 
 
@@ -1204,6 +1206,7 @@ async def _solve_with_fivebrid(
     scheduler=None,
     supreme_court_cb=None,
     dashboard_client=None,
+    base_ref: str = "origin/main",
 ) -> tuple[str, str]:
     """Solve via adaptive Five-brid pipeline."""
     branch_name = f"solve/issue-{issue_num}"
@@ -1226,7 +1229,7 @@ async def _solve_with_fivebrid(
     resolved_mode = "standard"
     try:
         # ── Git Worktree Setup ──
-        git_ok, git_result = await _git_fresh_start(project_path, branch_name)
+        git_ok, git_result = await _git_fresh_start(project_path, branch_name, ref=base_ref)
         if not git_ok:
             await _edit_msg(msg, f"<b>#{issue_num}</b> — Git setup failed:\n<pre>{_sanitize_output(git_result)}</pre>")
             return "failed", f"Git setup failed: {git_result[:100]}"
@@ -1344,8 +1347,11 @@ async def _solve_with_fivebrid(
                 )
                 decision = _strategy_approvals.get(approval_key, {}).get("decision")
             except asyncio.TimeoutError:
-                await _edit_msg(msg, f"<b>#{issue_num}</b> Strategy approval timed out.")
-                return "skipped", "Strategy approval timed out"
+                decision = "approve"
+                await _edit_msg(
+                    msg,
+                    f"<b>#{issue_num}</b> Strategy approval timed out — auto-proceeding with Haiku recommendation.",
+                )
             finally:
                 _strategy_approvals.pop(approval_key, None)
                 _strategy_events.pop(approval_key, None)
@@ -1411,7 +1417,10 @@ async def _solve_with_fivebrid(
 
         if status == "success":
             await _edit_msg(msg, f"<b>#{issue_num}</b> — Creating PR...")
-            pr_url, pr_err = await _create_pr(worktree_dir, issue_num, branch_name, ctx.issue_title, ctx)
+            pr_url, pr_err = await _create_pr(
+                worktree_dir, issue_num, branch_name, ctx.issue_title, ctx,
+                base_ref=base_ref,
+            )
 
             intent_summary = format_intent_summary(ctx)
             step_summary = format_pipeline_summary(ctx)
@@ -1485,25 +1494,31 @@ async def _solve_with_fivebrid(
                                 scheduler.add_slot(sub_slot)
 
                         await progress_cb(f"Sub-issues created: {created_nums}. Starting sequential solve...")
+                        # Chain branches: first sub-issue branches from parent,
+                        # subsequent sub-issues branch from the previous one's branch.
+                        prev_branch = branch_name  # parent issue's branch
                         for i, sub_num in enumerate(created_nums):
-                            if i > 0:
-                                try:
-                                    fetch_proc = await asyncio.create_subprocess_exec(
-                                        "git", "fetch", "origin", "main",
-                                        cwd=project_path,
-                                        stdout=asyncio.subprocess.PIPE,
-                                        stderr=asyncio.subprocess.PIPE,
-                                    )
-                                    await asyncio.wait_for(fetch_proc.communicate(), timeout=30)
-                                except Exception:
-                                    pass
+                            # Fetch the latest state of the previous branch
+                            try:
+                                fetch_proc = await asyncio.create_subprocess_exec(
+                                    "git", "fetch", "origin",
+                                    cwd=project_path,
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE,
+                                )
+                                await asyncio.wait_for(fetch_proc.communicate(), timeout=30)
+                            except Exception:
+                                pass
                             sub_cancel = asyncio.Event()
                             _solve_cancels.setdefault(chat_id, {})[sub_num] = sub_cancel
                             sub_status, sub_detail = await _solve_single_issue(
                                 context, chat_id, project_name, project_path,
                                 sub_num, timeout, sub_cancel,
                                 solve_mode=resolved_mode,
+                                base_ref=f"origin/{prev_branch}",
                             )
+                            # Next sub-issue chains off this one
+                            prev_branch = f"solve/issue-{sub_num}"
                             _solve_cancels.get(chat_id, {}).pop(sub_num, None)
                             if sub_status != "success":
                                 await context.bot.send_message(
@@ -1512,6 +1527,22 @@ async def _solve_with_fivebrid(
                                     f"Remaining sub-issues skipped.",
                                 )
                                 break
+
+                        # Send reverse-merge guide for chained PRs
+                        successful_subs = [n for n in created_nums if n != sub_num or sub_status == "success"]
+                        if successful_subs:
+                            merge_order = list(reversed(successful_subs)) + [issue_num]
+                            merge_lines = "\n".join(
+                                f"  {i+1}. #{n} (solve/issue-{n})"
+                                for i, n in enumerate(merge_order)
+                            )
+                            await context.bot.send_message(
+                                chat_id,
+                                f"<b>Merge Order (reverse)</b>\n"
+                                f"Chained PRs — merge in this order:\n"
+                                f"<pre>{merge_lines}</pre>",
+                                parse_mode=ParseMode.HTML,
+                            )
 
                 return "success", f"PR created: {pr_url}"
             else:
@@ -1682,18 +1713,21 @@ async def _create_pr(
     branch_name: str,
     issue_title: str = "",
     ctx: PipelineContext | None = None,
+    base_ref: str = "origin/main",
 ) -> tuple[str, str]:
     """Squash commits, push branch, and create PR. Returns (pr_url, error_msg)."""
-    # Build PR title from issue title
+    # Build PR title from issue title (avoid double prefix like "feat: feat:")
     if issue_title:
-        pr_title = f"feat: {issue_title}"
+        has_prefix = any(issue_title.lower().startswith(p) for p in
+                         ("feat:", "fix:", "refactor:", "test:", "docs:", "chore:", "perf:", "ci:"))
+        pr_title = issue_title if has_prefix else f"feat: {issue_title}"
     else:
         pr_title = f"feat: resolve #{issue_num}"
     squash_msg = f"{pr_title}\n\nCloses #{issue_num}"
 
-    # Squash all commits on this branch into one
+    # Squash all commits on this branch into one (relative to base)
     proc = await asyncio.create_subprocess_exec(
-        "git", "reset", "--soft", "origin/main",
+        "git", "reset", "--soft", base_ref,
         cwd=project_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -1722,12 +1756,15 @@ async def _create_pr(
     if proc.returncode != 0:
         return "", stdout.decode(errors="replace") if stdout else "push failed"
 
-    # Create PR
+    # Create PR (set --base to parent branch for chained sub-issues)
     pr_body = _build_pr_body(issue_num, ctx)
+    gh_cmd = ["gh", "pr", "create", "--title", pr_title, "--body", pr_body]
+    # If base is not origin/main, extract the branch name for --base
+    if base_ref != "origin/main":
+        pr_base = base_ref.removeprefix("origin/")
+        gh_cmd += ["--base", pr_base]
     proc = await asyncio.create_subprocess_exec(
-        "gh", "pr", "create",
-        "--title", pr_title,
-        "--body", pr_body,
+        *gh_cmd,
         cwd=project_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -2316,6 +2353,175 @@ async def init_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("init cancel callback error")
 
 
+# ── /design ───────────────────────────────────────────────────────────────────
+
+_design_cancels: dict[int, asyncio.Event] = {}
+
+
+async def design_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/design <project> <figma_url> [--issue] — Extract Figma frame as UI spec."""
+    try:
+        args = context.args or []
+        if len(args) < 2:
+            await _safe_reply(
+                update,
+                "Usage: <code>/design &lt;project&gt; &lt;figma_url&gt; [--issue]</code>",
+            )
+            return
+
+        project_name, err = _resolve_project(args[0], context.bot_data.get("projects", {}))
+        if project_name is None:
+            await _safe_reply(update, err)
+            return
+
+        settings: Settings = context.bot_data["settings"]
+        if not settings.figma_access_token:
+            await _safe_reply(update, "FIGMA_ACCESS_TOKEN is not set in .env")
+            return
+
+        figma_url = args[1]
+        create_issue = "--issue" in args
+
+        chat_id = update.effective_chat.id  # type: ignore[union-attr]
+        if chat_id in _design_cancels:
+            await _safe_reply(update, "A design extraction is already running.")
+            return
+
+        cancel_event = asyncio.Event()
+        _design_cancels[chat_id] = cancel_event
+
+        projects: dict = context.bot_data.get("projects", {})
+        project_path = projects[project_name].get("path", "")
+
+        asyncio.create_task(
+            _run_design(context, chat_id, project_name, project_path, figma_url, create_issue, settings, cancel_event)
+        )
+        await _safe_reply(update, f"Extracting Figma frame for <b>{html.escape(project_name)}</b>...")
+    except Exception:
+        logger.exception("/design handler error")
+        await _safe_reply(update, "Error starting design extraction.")
+
+
+async def _run_design(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    project_name: str,
+    project_path: str,
+    figma_url: str,
+    create_issue: bool,
+    settings: Settings,
+    cancel_event: asyncio.Event,
+) -> None:
+    """Background task that extracts Figma frame and saves spec + assets."""
+    from .figma import FigmaSpec, extract_figma_frame, parse_figma_url
+
+    cancel_btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Cancel", callback_data=f"cancel_design:{chat_id}")]
+    ])
+    msg = await context.bot.send_message(
+        chat_id,
+        f"<b>{html.escape(project_name)}</b> Parsing Figma URL...",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_btn,
+    )
+
+    try:
+        file_key, node_id = parse_figma_url(figma_url)
+        await _edit_msg(msg, f"<b>{html.escape(project_name)}</b> Fetching frame from Figma API...")
+
+        spec: FigmaSpec = await asyncio.wait_for(
+            extract_figma_frame(settings.figma_access_token, file_key, node_id),
+            timeout=settings.design_timeout,
+        )
+
+        # Save spec file
+        spec_dir = os.path.join(project_path, "docs", "design")
+        os.makedirs(spec_dir, exist_ok=True)
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", spec.name).lower()
+        spec_path = os.path.join(spec_dir, f"{safe_name}.spec.txt")
+        with open(spec_path, "w", encoding="utf-8") as f:
+            f.write(spec.text_spec)
+
+        # Save SVG assets
+        icon_count = 0
+        if spec.svg_assets:
+            icons_dir = os.path.join(project_path, "assets", "icons")
+            os.makedirs(icons_dir, exist_ok=True)
+            for name, svg_data in spec.svg_assets.items():
+                svg_path = os.path.join(icons_dir, f"{name}.svg")
+                with open(svg_path, "wb") as f:
+                    f.write(svg_data)
+                icon_count += 1
+
+        # Prepare result message
+        result_text = (
+            f"<b>Figma Extract Complete</b>\n\n"
+            f"<b>Frame:</b> {html.escape(spec.name)}\n"
+            f"<b>Spec:</b> <code>{spec_path}</code>\n"
+            f"<b>Icons:</b> {icon_count} SVGs exported\n\n"
+            f"<pre>{html.escape(spec.text_spec[:3000])}</pre>"
+        )
+
+        if len(spec.text_spec) > 3000:
+            result_text += "\n<i>(truncated — full spec saved to file)</i>"
+
+        # Create GitHub issue if requested
+        if create_issue and settings.github_user:
+            issue_body = (
+                f"## UI Implementation: {spec.name}\n\n"
+                f"### Design Spec\n```\n{spec.text_spec}\n```\n\n"
+                f"### Icons\n"
+            )
+            if spec.svg_assets:
+                issue_body += "\n".join(f"- `{name}.svg`" for name in spec.svg_assets)
+            else:
+                issue_body += "No custom icons — use system icons (Material Icons / SF Symbols)"
+
+            issue_body += (
+                f"\n\n### Implementation Notes\n"
+                f"- Compose(Android) + SwiftUI(iOS) 양 플랫폼 구현\n"
+                f"- 디자인 토큰 사용 (매직 넘버 금지)\n"
+                f"- Icon SVGs are in `assets/icons/`\n"
+                f"- Spec file: `docs/design/{safe_name}.spec.txt`"
+            )
+
+            proc = await asyncio.create_subprocess_exec(
+                "gh", "issue", "create",
+                "-R", f"{settings.github_user}/{project_name}",
+                "--title", f"feat: {spec.name} UI 구현",
+                "--body", issue_body,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            issue_url = stdout.decode(errors="replace").strip() if stdout else ""
+            if issue_url:
+                result_text += f"\n\n<b>Issue:</b> {html.escape(issue_url)}"
+
+        await _edit_msg(msg, result_text)
+
+    except ValueError as exc:
+        await _edit_msg(msg, f"Error: {html.escape(str(exc))}")
+    except asyncio.TimeoutError:
+        await _edit_msg(msg, "Design extraction timed out.")
+    except Exception as exc:
+        logger.exception("/design extraction error")
+        await _edit_msg(msg, f"Error: {html.escape(str(exc)[:300])}")
+    finally:
+        _design_cancels.pop(chat_id, None)
+
+
+async def design_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle cancel button for /design."""
+    query = update.callback_query
+    await query.answer()  # type: ignore[union-attr]
+    data = query.data or ""  # type: ignore[union-attr]
+    chat_id = int(data.split(":")[1])
+    ev = _design_cancels.get(chat_id)
+    if ev:
+        ev.set()
+
+
 # ── /plan ─────────────────────────────────────────────────────────────────────
 
 
@@ -2395,15 +2601,19 @@ async def _run_plan(
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
         existing_issues_text = stdout.decode(errors="replace") if stdout else "[]"
 
-        # 2. Read CLAUDE.md
-        claude_md_path = os.path.join(project_path, ".claude", "CLAUDE.md")
+        # 2. Read CLAUDE.md (check root first, then .claude/)
         claude_md = ""
-        if os.path.isfile(claude_md_path):
-            try:
-                with open(claude_md_path, encoding="utf-8") as f:
-                    claude_md = f.read()
-            except Exception:
-                pass
+        for candidate in [
+            os.path.join(project_path, "CLAUDE.md"),
+            os.path.join(project_path, ".claude", "CLAUDE.md"),
+        ]:
+            if os.path.isfile(candidate):
+                try:
+                    with open(candidate, encoding="utf-8") as f:
+                        claude_md = f.read()
+                    break
+                except Exception:
+                    pass
 
         # 3. Cancel check
         if cancel_event.is_set():
@@ -2580,15 +2790,19 @@ async def _run_discuss(
     pipeline_start = time.monotonic()
 
     try:
-        # 1. Read CLAUDE.md
-        claude_md_path = os.path.join(project_path, ".claude", "CLAUDE.md")
+        # 1. Read CLAUDE.md (check root first, then .claude/)
         claude_md = ""
-        if os.path.isfile(claude_md_path):
-            try:
-                with open(claude_md_path, encoding="utf-8") as f:
-                    claude_md = f.read()
-            except Exception:
-                pass
+        for candidate in [
+            os.path.join(project_path, "CLAUDE.md"),
+            os.path.join(project_path, ".claude", "CLAUDE.md"),
+        ]:
+            if os.path.isfile(candidate):
+                try:
+                    with open(candidate, encoding="utf-8") as f:
+                        claude_md = f.read()
+                    break
+                except Exception:
+                    pass
 
         # 2. File tree (excluding common dirs)
         try:

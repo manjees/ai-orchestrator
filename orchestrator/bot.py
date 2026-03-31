@@ -17,6 +17,8 @@ from .ai.ollama_provider import OllamaProvider
 from .config import Settings, load_projects
 from .handlers import (
     cmd_handler,
+    design_cancel_callback,
+    design_handler,
     discuss_cancel_callback,
     discuss_create_issues_callback,
     discuss_handler,
@@ -119,6 +121,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("retry", "Resume failed solve from checkpoint"),
         BotCommand("rebase", "Rebase PR onto main"),
         BotCommand("extract", "Generate training data from file"),
+        BotCommand("design", "Extract Figma frame as UI spec"),
     ])
 
     logger.info("Bot initialized — polling started")
@@ -175,6 +178,7 @@ def create_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("discuss", discuss_handler, filters=auth))
     app.add_handler(CommandHandler("rebase", rebase_handler, filters=auth))
     app.add_handler(CommandHandler("extract", extract_handler, filters=auth))
+    app.add_handler(CommandHandler("design", design_handler, filters=auth))
     app.add_handler(CommandHandler("help", help_handler, filters=auth))
 
     # Inline keyboard callbacks
@@ -185,6 +189,7 @@ def create_application(settings: Settings) -> Application:
     app.add_handler(CallbackQueryHandler(plan_cancel_callback, pattern=r"^cancel_plan:"))
     app.add_handler(CallbackQueryHandler(discuss_cancel_callback, pattern=r"^cancel_discuss:"))
     app.add_handler(CallbackQueryHandler(discuss_create_issues_callback, pattern=r"^discuss_issues:"))
+    app.add_handler(CallbackQueryHandler(design_cancel_callback, pattern=r"^cancel_design:"))
     app.add_handler(CallbackQueryHandler(strategy_callback, pattern=r"^strategy_"))
     app.add_handler(CallbackQueryHandler(supreme_court_callback, pattern=r"^court_"))
 

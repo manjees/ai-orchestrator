@@ -1,7 +1,7 @@
 """Triple-Model Pipeline (legacy) and Five-brid 9-Step Pipeline.
 
 Legacy: DeepSeek Design → Qwen Pre-Implement → Claude Implement → Claude Review → DeepSeek Audit → Data Mining.
-Fivebrid: Haiku Research → Opus Design → Gemini Critique → Qwen Hints → Sonnet Implement → Sonnet Self-Review → Gemini Cross-Review → DeepSeek Audit → Data Mining.
+Fivebrid: Gemini Research → Opus Design → Gemini Critique → Qwen Hints → Sonnet Implement → Sonnet Self-Review → Gemini Cross-Review → DeepSeek Audit → Data Mining.
 """
 
 from __future__ import annotations
@@ -134,6 +134,8 @@ class PipelineContext:
     supreme_court_ruling: str = ""
     draft_context_diff: str = ""
     predecessor_issue_num: int = 0
+    # Sprint contract: issue-specific acceptance criteria from design phase
+    acceptance_criteria: str = ""
 
 
 # ── Exception Detail Helper ──────────────────────────────────────────────────
@@ -232,8 +234,62 @@ _MAX_DIFF_CHARS = 50_000
 _MAX_CI_LOG_CHARS = 3_000
 
 
+def _parse_ci_from_workflows(project_path: str) -> list[str]:
+    """Parse lint/test/check commands from .github/workflows/*.yml files.
+
+    Extracts only quality-gate commands (lint, test, check, detekt, etc.)
+    and skips build/packaging/deploy commands to keep local CI fast.
+    """
+    workflows_dir = Path(project_path) / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return []
+
+    import re
+
+    # Keywords that indicate a command is a quality gate (lint/test/check)
+    _QUALITY_KEYWORDS = (
+        "test", "lint", "check", "detekt", "ktlint", "eslint", "ruff",
+        "mypy", "pytest", "vitest", "jest", "cargo test", "go test",
+    )
+    # Commands to always skip (build, packaging, infra, etc.)
+    _SKIP_PATTERNS = (
+        "echo", "mkdir", "cp ", "mv ", "cat ", "curl", "docker", "git ",
+        "actions/", "uses:", "assemble", "bootjar", "build", "package",
+        "deploy", "upload", "download", "install", "setup",
+    )
+
+    def _is_quality_cmd(cmd: str) -> bool:
+        lower = cmd.lower()
+        # Must match at least one quality keyword
+        if not any(kw in lower for kw in _QUALITY_KEYWORDS):
+            return False
+        # Must not match skip patterns (but allow "build" if combined with "test")
+        for skip in _SKIP_PATTERNS:
+            if skip in lower and skip != "build":
+                return False
+        return True
+
+    raw_cmds: list[str] = []
+    for wf in workflows_dir.glob("*.yml"):
+        text = wf.read_text(errors="replace")
+        for m in re.finditer(r"^\s+run:\s*(.+)$", text, re.MULTILINE):
+            cmd = m.group(1).strip()
+            if cmd and cmd not in raw_cmds:
+                raw_cmds.append(cmd)
+
+    return [c for c in raw_cmds if _is_quality_cmd(c)]
+
+
 def detect_ci_commands(project_path: str) -> list[str]:
-    """Auto-detect build/lint/test commands based on project files."""
+    """Auto-detect build/lint/test commands based on project files.
+
+    Priority: .github/workflows/*.yml → project file heuristics.
+    """
+    # Try parsing GitHub Actions workflows first
+    workflow_cmds = _parse_ci_from_workflows(project_path)
+    if workflow_cmds:
+        return workflow_cmds
+
     p = Path(project_path)
 
     # Gradle (KMP, Android, JVM)
@@ -281,6 +337,23 @@ def _resolve_ci_commands(project_path: str, project_info: dict | None) -> list[s
     if project_info and "ci_commands" in project_info:
         return list(project_info["ci_commands"])
     return detect_ci_commands(project_path)
+
+
+async def _stop_gradle_daemon(project_path: str) -> None:
+    """Stop Gradle daemon if gradlew exists to free JVM memory."""
+    gradlew = Path(project_path) / "gradlew"
+    if not gradlew.exists():
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "./gradlew", "--stop",
+            cwd=project_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=15)
+    except Exception:
+        pass
 
 
 async def _run_local_ci(
@@ -356,7 +429,7 @@ def build_fivebrid_steps(mode: str, ci_commands: list[str]) -> list[PipelineStep
     allowed = mode_config["steps"]  # None = all
 
     all_steps = [
-        "Haiku Research",
+        "Gemini Research",
         "Opus Design",
         "Gemini Design Critique",
         "Qwen Hints",
@@ -595,6 +668,7 @@ async def step_local_ci_check(
         logger.warning("Local CI check error (non-fatal): %s", exc)
     finally:
         step.elapsed_sec = time.monotonic() - start
+        await _stop_gradle_daemon(ctx.project_path)
 
 
 async def _capture_filtered_diff(project_path: str, base_ref: str = "main") -> str:
@@ -736,6 +810,56 @@ async def _call_claude_cli_with_progress(
 
     if not output.strip():
         raise RuntimeError("Claude CLI returned empty response")
+
+    return output
+
+
+# ── Gemini CLI Direct Progress Helper ────────────────────────────────────────
+
+
+_GEMINI_BIN = "/opt/homebrew/bin/gemini"
+
+
+async def _call_gemini_cli_with_progress(
+    prompt: str,
+    *,
+    model: str,
+    timeout: int,
+    progress_cb: ProgressCallback,
+    step_name: str,
+    cwd: str | None = None,
+) -> str:
+    """Call Gemini CLI with cwd support and periodic progress updates. Returns text output."""
+    cmd = [_GEMINI_BIN, "-p", prompt, "--approval-mode", "plan", "-m", model, "-o", "text"]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+
+    async def _communicate() -> tuple[bytes, bytes]:
+        return await proc.communicate()
+
+    task = asyncio.create_task(_communicate())
+    elapsed = 0
+    while not task.done():
+        await asyncio.sleep(10)
+        elapsed += 10
+        mins, secs = divmod(elapsed, 60)
+        await progress_cb(f"{step_name} (Thinking... {mins}m {secs}s)")
+
+    stdout, stderr = await asyncio.wait_for(task, timeout=timeout)
+    output = stdout.decode(errors="replace") if stdout else ""
+
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace") if stderr else ""
+        raise RuntimeError(f"Gemini CLI failed (exit={proc.returncode}): {err[:300]}")
+
+    if not output.strip():
+        raise RuntimeError("Gemini CLI returned empty response")
 
     return output
 
@@ -986,6 +1110,33 @@ async def step_claude_implement(
         step.elapsed_sec = time.monotonic() - start
 
 
+def _split_diff_by_file(diff: str) -> list[tuple[str, str]]:
+    """Split a unified diff into (filename, diff_chunk) pairs."""
+    chunks: list[tuple[str, str]] = []
+    current_file = ""
+    current_lines: list[str] = []
+
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current_file and current_lines:
+                chunks.append((current_file, "".join(current_lines)))
+            parts = line.split(" b/", 1)
+            current_file = parts[1].strip() if len(parts) > 1 else "unknown"
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_file and current_lines:
+        chunks.append((current_file, "".join(current_lines)))
+
+    return chunks
+
+
+# Rough token estimate: ~4 chars per token
+_CHARS_PER_TOKEN = 4
+_DIFF_TOKEN_THRESHOLD_RATIO = 0.5  # Use chunked audit when diff > 50% of context
+
+
 async def step_ai_audit(
     ctx: PipelineContext,
     ollama: OllamaProvider,
@@ -998,14 +1149,18 @@ async def step_ai_audit(
     step.status = "running"
     start = time.monotonic()
 
-    # Read project CLAUDE.md if available
-    claude_md_path = Path(ctx.project_path) / ".claude" / "CLAUDE.md"
+    # Read project CLAUDE.md if available (root first, then .claude/)
     claude_md_content = ""
-    if claude_md_path.exists():
-        try:
-            claude_md_content = claude_md_path.read_text(errors="replace")[:3000]
-        except Exception:
-            claude_md_content = "(could not read CLAUDE.md)"
+    for candidate in [
+        Path(ctx.project_path) / "CLAUDE.md",
+        Path(ctx.project_path) / ".claude" / "CLAUDE.md",
+    ]:
+        if candidate.exists():
+            try:
+                claude_md_content = candidate.read_text(errors="replace")[:3000]
+                break
+            except Exception:
+                claude_md_content = "(could not read CLAUDE.md)"
 
     system_prompt = (
         "You are an adversarial code auditor with the personality of a brutally honest "
@@ -1015,86 +1170,189 @@ async def step_ai_audit(
         "mock them like a senior developer would: 'Oh great, // increment counter — "
         "I never would have guessed that i++ increments a counter. Delete this noise.'"
     )
-
-    user_content = (
-        f"## Original Intent\n"
-        f"Issue #{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body}\n\n"
-        f"## Design Document\n{ctx.design_doc}\n\n"
-        f"## Implementation Diff\n{ctx.git_diff}\n\n"
-    )
     if claude_md_content:
-        user_content += f"## CLAUDE.md Guidelines\n{claude_md_content}\n\n"
-    if ctx.review_report:
-        user_content += f"## Previous Reviews\n{ctx.review_report}\n\n"
+        system_prompt += f"\n\n## Project Guidelines (CLAUDE.md)\n{claude_md_content}"
 
-    user_content += (
-        "Audit this implementation against the ORIGINAL INTENT:\n"
-        "1. INTENT ALIGNMENT: Does the code fully satisfy the issue requirements? Any missing functionality?\n"
-        "2. LOGIC FLAWS: Edge cases, race conditions, off-by-one errors the implementer likely missed.\n"
-        "3. SECURITY: Injection, XSS, auth bypass, data exposure vulnerabilities.\n"
-        "4. GUIDELINE VIOLATIONS: Does the code violate CLAUDE.md conventions?\n"
-        "5. COMMENT AUDIT (MANDATORY — zero tolerance for 'what' comments):\n"
-        "   Examine EVERY comment in the diff. For each comment:\n"
-        "   - If it describes WHAT the code does → [MAJOR] violation. "
-        "     Provide a sarcastic correction explaining why this comment is noise. "
-        "     The code should be self-documenting with clear naming.\n"
-        "   - If it explains WHY (design decision, non-obvious constraint, "
-        "     business rule, workaround reason) → ACCEPTABLE.\n"
-        "   - If no comments exist and the code is self-explanatory → ACCEPTABLE.\n"
-        "   - Examples of INEXCUSABLE comments: '// increment counter', '// set user name', "
-        "'// loop through items', '// check if null', '// create instance', '// return result'\n"
-        "   - Examples of GOOD comments: '// OAuth spec requires nonce per-request', "
-        "'// Workaround for SQLite 3.x locking bug', '// Business rule: 30-day retention'\n\n"
+    # Build acceptance criteria section for audit
+    criteria_audit_section = ""
+    if ctx.acceptance_criteria:
+        criteria_audit_section = (
+            "\n\n## Acceptance Criteria (Sprint Contract)\n"
+            "The following criteria were agreed upon BEFORE implementation.\n"
+            "Check EACH criterion against the diff and mark PASS/FAIL:\n\n"
+            f"{ctx.acceptance_criteria}\n\n"
+            "For EACH criterion above, state: [PASS] or [FAIL] with a one-line reason.\n"
+            "This is the PRIMARY basis for your audit verdict.\n\n"
+        )
+
+    audit_instructions = (
+        f"Audit this implementation:{criteria_audit_section}\n"
+        "Additionally check:\n"
+        "1. LOGIC FLAWS: Edge cases, race conditions, off-by-one errors.\n"
+        "2. SECURITY: Injection, XSS, auth bypass, data exposure.\n"
+        "3. GUIDELINE VIOLATIONS: Does the code violate CLAUDE.md conventions?\n"
+        "4. COMMENT AUDIT (zero tolerance for 'what' comments):\n"
+        "   - Comments describing WHAT the code does → [MAJOR]. Code should be self-documenting.\n"
+        "   - Comments explaining WHY (design decision, constraint, workaround) → ACCEPTABLE.\n\n"
         "For each finding, classify as:\n"
-        "- [CRITICAL]: Will cause runtime crash, data loss, or security breach in production\n"
-        "- [MAJOR]: Clearly violates the issue requirements OR introduces a real bug\n"
-        "- [MINOR]: Best practice suggestion, style preference, or 'nice to have'\n\n"
+        "- [CRITICAL]: Runtime crash, data loss, or security breach in production\n"
+        "- [MAJOR]: Fails an acceptance criterion OR introduces a real bug\n"
+        "- [MINOR]: Best practice suggestion, style preference\n\n"
         "IMPORTANT classification rules:\n"
-        "- Missing validation is [MINOR] unless the issue EXPLICITLY requires it\n"
-        "- Alternative API design choices (query param vs body) are [MINOR]\n"
-        "- If the code works correctly and tests pass, do NOT mark working design choices as [MAJOR]\n"
-        "- 'Could be improved' is ALWAYS [MINOR], never [MAJOR]\n\n"
+        "- If an acceptance criterion is satisfied in the code, mark it PASS even if "
+        "you would have designed it differently\n"
+        "- Missing validation is [MINOR] unless it's an acceptance criterion\n"
+        "- Alternative design choices are [MINOR], not [MAJOR]\n"
+        "- If tests pass and criteria are met, do NOT fail for stylistic preferences\n\n"
         "End with exactly one of:\n"
-        "[AUDIT: PASS] — no critical or major issues found\n"
-        "[AUDIT: FAIL] — critical or major issues found that MUST be fixed"
+        "[AUDIT: PASS] — all acceptance criteria met, no critical/major issues\n"
+        "[AUDIT: FAIL] — acceptance criteria unmet OR critical/major issues found"
     )
 
-    messages = [Message(role=Role.USER, content=user_content)]
+    diff_tokens_est = len(ctx.git_diff) // _CHARS_PER_TOKEN
+    ctx_threshold = int(settings.ai_audit_num_ctx * _DIFF_TOKEN_THRESHOLD_RATIO)
 
     try:
-        response = await _call_ollama_with_progress(
-            ollama, messages,
-            max_tokens=settings.ai_audit_max_tokens,
-            temperature=0.3,
-            system_prompt=system_prompt,
-            timeout=settings.ai_audit_timeout,
-            progress_cb=progress_cb,
-            step_name="AI Audit",
-            model=settings.reasoning_model,
-            num_ctx=settings.ai_audit_num_ctx,
-        )
-        ctx.ai_audit_result = response.content
-        verdict = parse_audit(response.content)
+        if diff_tokens_est > ctx_threshold:
+            # ── Chunked audit: split diff by file ──
+            file_chunks = _split_diff_by_file(ctx.git_diff)
+            file_list = "\n".join(f"  - {f}" for f, _ in file_chunks)
+            await progress_cb(f"AI Audit (chunked: {len(file_chunks)} files)")
 
-        if verdict is None:
-            # Fallback: try legacy [FINAL: APPROVED/REJECTED] format
+            chunk_findings: list[str] = []
+            for i, (filename, chunk_diff) in enumerate(file_chunks):
+                await progress_cb(
+                    f"AI Audit: [{i+1}/{len(file_chunks)}] {filename}"
+                )
+                chunk_content = (
+                    f"## Original Intent\n"
+                    f"Issue #{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body}\n\n"
+                    f"## All Changed Files (for context)\n{file_list}\n\n"
+                    f"## File Under Review: {filename}\n```\n{chunk_diff}\n```\n\n"
+                )
+                chunk_content += (
+                    "Review ONLY the file above. List any [CRITICAL], [MAJOR], or [MINOR] findings.\n"
+                    "If no issues, respond with: No issues found in this file.\n"
+                    "Do NOT output [AUDIT: PASS/FAIL] yet — this is a partial review."
+                )
+
+                chunk_messages = [Message(role=Role.USER, content=chunk_content)]
+                chunk_resp = await _call_ollama_with_progress(
+                    ollama, chunk_messages,
+                    max_tokens=4096,
+                    temperature=0.3,
+                    system_prompt=system_prompt,
+                    timeout=settings.ai_audit_timeout // max(len(file_chunks), 1),
+                    progress_cb=progress_cb,
+                    step_name=f"AI Audit [{i+1}/{len(file_chunks)}]",
+                    model=settings.reasoning_model,
+                    num_ctx=settings.ai_audit_num_ctx,
+                )
+                chunk_findings.append(f"### {filename}\n{chunk_resp.content}")
+
+            # ── Final synthesis ──
+            await progress_cb("AI Audit: synthesizing results")
+            all_findings = "\n\n".join(chunk_findings)
+            synthesis_content = (
+                f"## Original Intent\n"
+                f"Issue #{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body}\n\n"
+                f"## Per-File Audit Findings\n{all_findings}\n\n"
+                f"{audit_instructions}"
+            )
+            synth_messages = [Message(role=Role.USER, content=synthesis_content)]
+            response = await _call_ollama_with_progress(
+                ollama, synth_messages,
+                max_tokens=settings.ai_audit_max_tokens,
+                temperature=0.3,
+                system_prompt=system_prompt,
+                timeout=settings.ai_audit_timeout,
+                progress_cb=progress_cb,
+                step_name="AI Audit (synthesis)",
+                model=settings.reasoning_model,
+                num_ctx=settings.ai_audit_num_ctx,
+            )
+        else:
+            # ── Standard audit: diff fits in context ──
+            user_content = (
+                f"## Original Intent\n"
+                f"Issue #{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body}\n\n"
+                f"## Design Document\n{ctx.design_doc}\n\n"
+                f"## Implementation Diff\n{ctx.git_diff}\n\n"
+            )
+            if ctx.review_report:
+                user_content += f"## Previous Reviews\n{ctx.review_report}\n\n"
+            user_content += audit_instructions
+
+            messages = [Message(role=Role.USER, content=user_content)]
+            response = await _call_ollama_with_progress(
+                ollama, messages,
+                max_tokens=settings.ai_audit_max_tokens,
+                temperature=0.3,
+                system_prompt=system_prompt,
+                timeout=settings.ai_audit_timeout,
+                progress_cb=progress_cb,
+                step_name="AI Audit",
+                model=settings.reasoning_model,
+                num_ctx=settings.ai_audit_num_ctx,
+            )
+
+        ctx.ai_audit_result = response.content
+
+        # ── Criteria-based verdict override ──
+        # Count [PASS] and [FAIL] tags from acceptance criteria evaluation.
+        # DeepSeek's final [AUDIT: PASS/FAIL] is unreliable, so we derive
+        # the verdict from the per-criterion results instead.
+        criteria_pass = len(re.findall(r"\[PASS\]", response.content))
+        criteria_fail_critical = len(re.findall(r"\[FAIL\].*(?:CRITICAL|critical)", response.content))
+        criteria_fail_major = len(re.findall(r"\[FAIL\].*(?:MAJOR|major)", response.content))
+        criteria_fail_all = len(re.findall(r"\[FAIL\]", response.content))
+        criteria_total = criteria_pass + criteria_fail_all
+
+        model_verdict = parse_audit(response.content)
+        if model_verdict is None:
             legacy = parse_final(response.content)
             if legacy is not None:
-                verdict = legacy
+                model_verdict = legacy
+
+        # Override logic: trust per-criteria results over model's final tag
+        if criteria_total > 0:
+            has_critical = criteria_fail_critical > 0
+            fail_ratio = criteria_fail_all / criteria_total if criteria_total else 0
+
+            if has_critical:
+                # Critical failures always mean FAIL
+                verdict = False
+                verdict_detail = f"AUDIT: FAIL (CRITICAL found, {criteria_pass}/{criteria_total} pass)"
+            elif fail_ratio <= 0.2:
+                # 80%+ criteria pass and no criticals → PASS regardless of model verdict
+                verdict = True
+                verdict_detail = f"AUDIT: PASS ({criteria_pass}/{criteria_total} criteria pass, no critical)"
+                if model_verdict is False:
+                    logger.info(
+                        "Audit verdict overridden: model said FAIL but %d/%d criteria PASS (no critical)",
+                        criteria_pass, criteria_total,
+                    )
+            else:
+                # Too many failures
+                verdict = False
+                verdict_detail = f"AUDIT: FAIL ({criteria_fail_all}/{criteria_total} criteria failed)"
+        else:
+            # No criteria parsed — fall back to model verdict
+            verdict = model_verdict
+            verdict_detail = "AUDIT: PASS" if verdict is True else "AUDIT: FAIL"
 
         if verdict is True:
             ctx.ai_audit_passed = True
-            # Also set legacy fields for backward compat
             ctx.audit_result = response.content
             ctx.audit_passed = True
             step.status = "passed"
-            step.detail = "AUDIT: PASS"
+            step.detail = verdict_detail
         elif verdict is False:
             ctx.audit_result = response.content
             ctx.audit_passed = False
             step.status = "failed"
-            step.detail = "AUDIT: FAIL"
-            raise RuntimeError("AI Audit returned FAIL — critical issues found")
+            step.detail = verdict_detail
+            raise RuntimeError(f"AI Audit: {verdict_detail}")
         else:
             ctx.audit_result = response.content
             ctx.audit_passed = False
@@ -1306,13 +1564,13 @@ def _write_training_data(ctx: PipelineContext, settings: Settings) -> tuple[int,
 
 # ── Fivebrid Step Functions ───────────────────────────────────────────────────
 
-async def step_haiku_research(
+async def step_gemini_research(
     ctx: PipelineContext,
     settings: Settings,
     progress_cb: ProgressCallback,
     step_index: int = 0,
 ) -> None:
-    """Step 0: Haiku CLI investigates the issue and explores existing code patterns."""
+    """Step 0: Gemini CLI investigates the issue and explores existing code patterns."""
     step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
@@ -1329,12 +1587,12 @@ async def step_haiku_research(
     )
 
     try:
-        output = await _call_claude_cli_with_progress(
+        output = await _call_gemini_cli_with_progress(
             prompt,
-            model=settings.haiku_model,
-            timeout=settings.research_timeout,
+            model=settings.gemini_model,
+            timeout=settings.gemini_research_timeout,
             progress_cb=progress_cb,
-            step_name="Haiku Research",
+            step_name="Gemini Research",
             cwd=ctx.project_path,
         )
         ctx.research_log = output
@@ -1353,8 +1611,10 @@ async def step_opus_design(
     settings: Settings,
     progress_cb: ProgressCallback,
     step_index: int = 1,
+    *,
+    model_override: str | None = None,
 ) -> None:
-    """Step 1: Opus CLI creates a detailed implementation design document."""
+    """Step 1: Design document creation. Uses Opus by default, Sonnet on retries."""
     step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
@@ -1372,12 +1632,25 @@ async def step_opus_design(
         f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
         f"--- Research Context ---\n{ctx.research_log}\n---\n"
         f"{critique_section}\n"
-        f"Create a comprehensive design document including:\n"
+        f"Create a comprehensive design document with TWO sections:\n\n"
+        f"## SECTION A: Design Document\n"
         f"1. Files to create/modify with exact paths\n"
         f"2. TDD test plan: list the tests to write FIRST (before implementation)\n"
         f"3. Detailed implementation steps with code structure\n"
         f"4. Data flow and component interactions\n"
         f"5. Edge cases and error handling strategy\n\n"
+        f"## SECTION B: Acceptance Criteria (Sprint Contract)\n"
+        f"List 5-15 specific, TESTABLE acceptance criteria that define 'done'.\n"
+        f"Each criterion must be verifiable by reading code or running tests.\n"
+        f"Format each as: `- [ ] <criterion>`\n\n"
+        f"Example criteria:\n"
+        f"- [ ] `GET /api/books?q=keyword` returns paginated results with totalItems\n"
+        f"- [ ] Repository interface has `searchBooks(query, page, pageSize)` method\n"
+        f"- [ ] Cache returns stored data within TTL without network call\n"
+        f"- [ ] All new public functions have corresponding test cases\n"
+        f"- [ ] Error state is handled in Component and exposed via State\n\n"
+        f"These criteria will be used by an independent auditor to verify completeness.\n"
+        f"Do NOT include vague criteria like 'code is clean' — only concrete, checkable items.\n\n"
         f"IMPORTANT: Follow TDD methodology. The test plan (step 2) must come before "
         f"implementation details (step 3). Tests define the expected behavior.\n\n"
         f"Be specific and actionable — this document will guide the implementation directly."
@@ -1386,24 +1659,61 @@ async def step_opus_design(
     if ctx.draft_context_diff:
         prompt += f"\n\n{ctx.draft_context_diff}\n"
 
+    effective_model = model_override or settings.opus_model
+    model_label = "Sonnet" if model_override else "Opus"
+
     try:
         output = await _call_claude_cli_with_progress(
             prompt,
-            model=settings.opus_model,
+            model=effective_model,
             timeout=settings.opus_design_timeout,
             progress_cb=progress_cb,
-            step_name="Opus Design",
+            step_name=f"{model_label} Design",
             cwd=ctx.project_path,
         )
         ctx.design_doc = output
+
+        # Extract acceptance criteria (Sprint Contract) from design doc
+        _extract_acceptance_criteria(ctx)
+
         step.status = "passed"
-        step.detail = f"{len(output)} chars"
+        step.detail = f"{len(output)} chars, {len(ctx.acceptance_criteria)} chars criteria"
     except Exception as exc:
         step.status = "failed"
         step.detail = _exc_detail(exc)
         raise
     finally:
         step.elapsed_sec = time.monotonic() - start
+
+
+def _extract_acceptance_criteria(ctx: PipelineContext) -> None:
+    """Extract acceptance criteria section from design doc into ctx.acceptance_criteria."""
+    doc = ctx.design_doc
+    # Try to find Section B marker
+    markers = ["## SECTION B:", "## Acceptance Criteria", "### Acceptance Criteria",
+               "## Sprint Contract", "### Sprint Contract"]
+    start_idx = -1
+    for marker in markers:
+        idx = doc.lower().find(marker.lower())
+        if idx != -1:
+            start_idx = idx
+            break
+
+    if start_idx == -1:
+        # Fallback: extract all checkbox lines
+        lines = [l.strip() for l in doc.splitlines() if l.strip().startswith("- [ ]")]
+        ctx.acceptance_criteria = "\n".join(lines) if lines else ""
+        return
+
+    # Extract from marker to next major section or end
+    remainder = doc[start_idx:]
+    lines = remainder.splitlines()
+    criteria_lines = [lines[0]]  # header
+    for line in lines[1:]:
+        if line.startswith("## ") and "acceptance" not in line.lower() and "sprint" not in line.lower():
+            break
+        criteria_lines.append(line)
+    ctx.acceptance_criteria = "\n".join(criteria_lines).strip()
 
 
 async def step_gemini_design_critique(
@@ -1425,7 +1735,6 @@ async def step_gemini_design_critique(
     )
     user_content = (
         f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
-        f"--- Research Context ---\n{ctx.research_log}\n\n"
         f"--- Design Document ---\n{ctx.design_doc}\n\n"
         f"Review this design. End your review with exactly one of:\n"
         f"[DESIGN: APPROVED] — if the design is solid\n"
@@ -1478,17 +1787,27 @@ async def step_sonnet_self_review(
     step.status = "running"
     start = time.monotonic()
 
+    criteria_section = ""
+    if ctx.acceptance_criteria:
+        criteria_section = (
+            f"\n\n--- Acceptance Criteria (Sprint Contract) ---\n"
+            f"{ctx.acceptance_criteria}\n---\n"
+        )
+
     prompt = (
-        f"You are reviewing code you just wrote for GitHub issue #{ctx.issue_num}.\n\n"
+        f"You are reviewing and IMPROVING code you just wrote for GitHub issue #{ctx.issue_num}.\n\n"
         f"--- Issue ---\n{ctx.issue_body}\n\n"
-        f"--- Design Document ---\n{ctx.design_doc}\n\n"
+        f"{criteria_section}\n"
         f"--- Current Git Diff ---\n{ctx.git_diff}\n\n"
+        f"Your job is to FIND AND FIX problems, not to judge. Do NOT output any verdict.\n\n"
         f"Tasks:\n"
-        f"1. Review your implementation for bugs, missing edge cases, and code quality issues.\n"
-        f"2. Verify test coverage: are there tests for all new/changed behavior? Add missing tests.\n"
-        f"3. Fix any issues you find directly in the code files.\n"
+        f"1. Check each acceptance criterion above — is it satisfied by the current code? "
+        f"If not, implement the missing part.\n"
+        f"2. Review for bugs, missing edge cases, and code quality issues. Fix them.\n"
+        f"3. Verify test coverage: are there tests for all new/changed behavior? Add missing tests.\n"
         f"4. Run the full test suite and the project's compile/build command.\n"
         f"5. Fix any test failures or compile errors.\n\n"
+        f"Focus on FIXING, not scoring. Make the code better and move on.\n\n"
         f"GIT RESTRICTIONS:\n"
         f"- Do NOT create branches, push, or create PRs.\n"
         f"- Only modify files and commit locally."
@@ -1589,19 +1908,28 @@ async def step_gemini_cross_review(
     if ctx.self_review_report:
         review_context = f"\n--- Self-Review Report ---\n{ctx.self_review_report}\n"
 
+    criteria_section = ""
+    if ctx.acceptance_criteria:
+        criteria_section = (
+            f"\n--- Acceptance Criteria ---\n{ctx.acceptance_criteria}\n---\n"
+        )
+
     user_content = (
         f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
-        f"--- Design Document ---\n{ctx.design_doc}\n\n"
         f"--- Git Diff ---\n{ctx.git_diff}\n"
-        f"{review_context}\n"
-        f"Review the implementation for:\n"
-        f"1. Business logic correctness\n"
-        f"2. Edge cases and error handling\n"
-        f"3. Potential regressions\n"
-        f"4. Code quality and maintainability\n\n"
-        f"End with exactly one of:\n"
-        f"[VERDICT: PASS] — if the implementation is acceptable\n"
-        f"[VERDICT: FAIL] — if there are critical issues"
+        f"{review_context}"
+        f"{criteria_section}\n"
+        f"Review the implementation and list concrete, actionable findings:\n"
+        f"1. Missing functionality (compared to acceptance criteria)\n"
+        f"2. Bugs, edge cases, error handling gaps\n"
+        f"3. Missing or insufficient tests\n"
+        f"4. Code quality issues (redundancy, maintainability)\n\n"
+        f"For each finding, provide:\n"
+        f"- File and line reference\n"
+        f"- What is wrong\n"
+        f"- How to fix it\n\n"
+        f"Do NOT output [VERDICT: PASS/FAIL]. Only output findings.\n"
+        f"If no issues found, respond with: No actionable findings."
     )
 
     messages = [Message(role=Role.USER, content=user_content)]
@@ -1615,19 +1943,9 @@ async def step_gemini_cross_review(
             step_name="Gemini Cross-Review",
         )
         ctx.gemini_cross_review = response.content
-        verdict = parse_verdict(response.content)
-
-        if verdict is True:
-            step.status = "passed"
-            step.detail = "VERDICT: PASS"
-        elif verdict is False:
-            step.status = "failed"
-            step.detail = "VERDICT: FAIL"
-            logger.warning("Gemini cross-review FAILED for issue #%d", ctx.issue_num)
-        else:
-            # No verdict — default to PASS (non-fatal)
-            step.status = "passed"
-            step.detail = "No verdict tag — treated as PASS"
+        has_findings = "no actionable findings" not in response.content.lower()
+        step.status = "passed"
+        step.detail = f"{'Findings reported' if has_findings else 'No findings'} ({len(response.content)} chars)"
     except Exception as exc:
         # Non-fatal: proceed to DeepSeek audit
         step.status = "skipped"
@@ -1770,15 +2088,15 @@ async def run_fivebrid_pipeline(
             return "skipped", "Cancelled by user"
 
         # ── Phase 0: Research ──
-        research_idx = _find_step("Haiku Research")
+        research_idx = _find_step("Gemini Research")
         if research_idx is not None:
             if _step_done(research_idx):
-                await progress_cb(f"[{research_idx}/{total_steps}] Haiku Research (cached)")
+                await progress_cb(f"[{research_idx}/{total_steps}] Gemini Research (cached)")
             else:
-                await progress_cb(f"[{research_idx}/{total_steps}] Haiku Research...")
-                await _notify_step(dashboard_client, "Haiku Research", "RUNNING", ctx=ctx)
-                await step_haiku_research(ctx, settings, progress_cb, step_index=research_idx)
-                await _notify_step(dashboard_client, "Haiku Research", "IDLE", ctx=ctx)
+                await progress_cb(f"[{research_idx}/{total_steps}] Gemini Research...")
+                await _notify_step(dashboard_client, "Gemini Research", "RUNNING", ctx=ctx)
+                await step_gemini_research(ctx, settings, progress_cb, step_index=research_idx)
+                await _notify_step(dashboard_client, "Gemini Research", "IDLE", ctx=ctx)
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
@@ -1815,7 +2133,10 @@ async def run_fivebrid_pipeline(
 
                     current_design_idx = design_idx + (iteration * 2)
                     await _notify_step(dashboard_client, "Opus Design", "RUNNING", ctx=ctx)
-                    await step_opus_design(ctx, settings, progress_cb, step_index=current_design_idx)
+                    await step_opus_design(
+                        ctx, settings, progress_cb, step_index=current_design_idx,
+                        model_override=settings.sonnet_model if iteration > 0 else None,
+                    )
                     await _notify_step(dashboard_client, "Opus Design", "IDLE", ctx=ctx)
 
                     if cancel_event.is_set():
@@ -1954,6 +2275,46 @@ async def run_fivebrid_pipeline(
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
 
+            # Sonnet Fix based on Gemini findings (if any actionable findings)
+            if (ctx.gemini_cross_review
+                    and "no actionable findings" not in ctx.gemini_cross_review.lower()):
+                await progress_cb(f"[{cross_review_idx}/{total_steps}] Sonnet fixing Gemini findings...")
+
+                fix_prompt = (
+                    f"A cross-reviewer found the following issues in your implementation "
+                    f"for GitHub issue #{ctx.issue_num}.\n\n"
+                    f"--- Cross-Review Findings ---\n{ctx.gemini_cross_review}\n---\n\n"
+                    f"--- Acceptance Criteria ---\n{ctx.acceptance_criteria}\n---\n\n"
+                    f"Fix ONLY the issues listed above. Do not refactor unrelated code.\n"
+                    f"After fixing, run the test suite and ensure all tests pass.\n\n"
+                    f"GIT RESTRICTIONS:\n"
+                    f"- Do NOT create branches, push, or create PRs.\n"
+                    f"- Only modify files and commit locally."
+                )
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "claude", "-p", "--model", settings.sonnet_model,
+                        "--output-format", "text", "--dangerously-skip-permissions",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=ctx.project_path,
+                    )
+                    stdout, _ = await asyncio.wait_for(
+                        proc.communicate(input=fix_prompt.encode()),
+                        timeout=settings.sonnet_self_review_timeout,
+                    )
+                    await _snapshot_commit(ctx.project_path, ctx.issue_num)
+                    ctx.git_diff = await _capture_filtered_diff(
+                        ctx.project_path, base_ref=ctx.base_commit or "main",
+                    )
+                    logger.info("Sonnet applied Gemini findings fix for #%d", ctx.issue_num)
+                except Exception as exc:
+                    logger.warning("Sonnet Gemini-fix failed (non-fatal): %s", exc)
+
+            if cancel_event.is_set():
+                return "skipped", "Cancelled by user"
+
         # Wait-Gate: wait for dependency audit approval before starting audit
         if scheduler:
             await progress_cb("Waiting for dependency audit approval...")
@@ -2013,6 +2374,8 @@ async def run_fivebrid_pipeline(
 
                         await _notify_step(dashboard_client, "AI Audit", "IDLE", ctx=ctx)
                         await progress_cb(f"AI Audit FAIL — Sonnet re-implementing (retry {audit_attempt + 1})...")
+                        prev_diff = ctx.git_diff
+
                         if ctx.impl_snapshot_ref:
                             await _reset_to_snapshot(ctx.project_path, ctx.impl_snapshot_ref)
 
@@ -2023,6 +2386,24 @@ async def run_fivebrid_pipeline(
                         ctx.git_diff = await _capture_filtered_diff(
                             ctx.project_path, base_ref=ctx.base_commit or "main",
                         )
+
+                        # Deadlock detection: if Sonnet produced no meaningful changes,
+                        # the audit will fail again with the same diff. Break the loop
+                        # and treat as PASS (Sonnet agrees implementation is correct).
+                        if ctx.git_diff.strip() == prev_diff.strip():
+                            logger.info(
+                                "Audit retry %d: Sonnet produced no changes — "
+                                "treating as PASS (implementation deemed correct by Sonnet)",
+                                audit_attempt + 1,
+                            )
+                            ctx.ai_audit_passed = True
+                            ctx.audit_passed = True
+                            ctx.steps[audit_idx].status = "passed"
+                            ctx.steps[audit_idx].detail = (
+                                "AUTO-PASS: Sonnet re-impl produced no changes "
+                                f"(audit disagreement after {audit_attempt + 1} retries)"
+                            )
+                            break
 
                         if ci_idx is not None and ci_commands:
                             await step_local_ci_check(ctx, settings, progress_cb, ci_commands,

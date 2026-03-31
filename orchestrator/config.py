@@ -63,7 +63,7 @@ class Settings(BaseSettings):
 
     # Optional
     ollama_base_url: str = "http://localhost:11434"
-    reasoning_model: str = "deepseek-r1:32b"     # CoT reasoning (Audit)
+    reasoning_model: str = "qwen2.5-coder:32b"   # Code-specialized (Audit)
     tmux_session_name: str = "ai_factory"
     log_level: str = "INFO"
     cmd_timeout: int = 30
@@ -80,6 +80,7 @@ class Settings(BaseSettings):
 
     # Gemini
     gemini_model: str = "gemini-2.5-pro"
+    gemini_research_timeout: int = 180     # Gemini research (file exploration, 3 min)
 
     # Phase 0: Research (Haiku CLI)
     haiku_model: str = "claude-haiku-4-5-20251001"
@@ -138,6 +139,10 @@ class Settings(BaseSettings):
     # Supreme Court
     supreme_court_timeout: int = 600    # Gemini mediation (10 min)
     supreme_court_user_timeout: int = 300  # user decision wait (5 min)
+
+    # Figma
+    figma_access_token: str = ""
+    design_timeout: int = 120  # /design command timeout (2 min)
 
     # AI Auditor (Intent-Based Cross-Model Audit)
     ai_audit_enabled: bool = True
