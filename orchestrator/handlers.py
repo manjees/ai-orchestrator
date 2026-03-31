@@ -1677,6 +1677,9 @@ def _build_pr_body(issue_num: int, ctx: PipelineContext | None = None) -> str:
             design_summary += "\n\n_(truncated)_"
         sections.append(f"## Design\n{design_summary}")
 
+    if ctx and ctx.design_suggestions:
+        sections.append(f"## Design Suggestions (non-blocking)\n{ctx.design_suggestions[:800]}")
+
     if ctx and ctx.git_diff:
         # Count changed files from diff
         diff_files = [

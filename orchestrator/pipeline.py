@@ -117,6 +117,7 @@ class PipelineContext:
     research_log: str = ""
     gemini_design_critique: str = ""
     design_iteration: int = 0
+    design_suggestions: str = ""  # Non-blocking suggestions from critique
     self_review_report: str = ""
     gemini_cross_review: str = ""
     impl_snapshot_ref: str = ""
@@ -1764,7 +1765,19 @@ async def step_gemini_design_critique(
 
         if verdict is True:
             step.status = "passed"
-            step.detail = "DESIGN: APPROVED"
+            # Extract suggestions from APPROVED critique for visibility
+            critique_text = response.content
+            suggestion_lines = [
+                l.strip() for l in critique_text.splitlines()
+                if l.strip() and not l.strip().startswith("[DESIGN:")
+                and any(kw in l.lower() for kw in ("suggest", "consider", "could", "might", "recommend", "optional", "improvement", "note:"))
+            ]
+            if suggestion_lines:
+                suggestions = "; ".join(suggestion_lines[:3])  # Top 3 suggestions
+                step.detail = f"APPROVED (suggestions: {suggestions[:300]})"
+                ctx.design_suggestions = "\n".join(suggestion_lines)
+            else:
+                step.detail = "DESIGN: APPROVED"
         elif verdict is False:
             step.status = "revised"
             step.detail = "DESIGN: NEEDS_REVISION"
