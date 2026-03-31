@@ -1514,7 +1514,7 @@ async def _solve_with_fivebrid(
                             sub_status, sub_detail = await _solve_single_issue(
                                 context, chat_id, project_name, project_path,
                                 sub_num, timeout, sub_cancel,
-                                solve_mode=resolved_mode,
+                                solve_mode="standard",  # Skip Research for sub-issues (Design handles context)
                                 base_ref=f"origin/{prev_branch}",
                             )
                             # Next sub-issue chains off this one
