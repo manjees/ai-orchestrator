@@ -104,6 +104,7 @@ class PipelineContext:
     issue_title: str = ""
     base_commit: str = ""  # HEAD hash at worktree creation (before Claude runs)
     design_doc: str = ""
+    design_plan: str = ""   # Section A only (implementation strategy, files, TDD plan)
     qwen_hints: str = ""
     git_diff: str = ""
     review_report: str = ""
@@ -781,11 +782,14 @@ async def _call_claude_cli_with_progress(
     step_name: str,
     cwd: str | None = None,
     dangerously_skip_permissions: bool = False,
+    max_turns: int | None = None,
 ) -> str:
     """Call Claude CLI with periodic progress updates. Returns the text output."""
     cmd = ["claude", "-p", "--model", model, "--output-format", "text"]
     if dangerously_skip_permissions:
         cmd.append("--dangerously-skip-permissions")
+    if max_turns is not None:
+        cmd += ["--max-turns", str(max_turns)]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -942,8 +946,8 @@ async def step_qwen_pre_implement(
         "and import statements. Be maximally concise."
     )
     user_content = (
-        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
-        f"--- Design Guide ---\n{ctx.design_doc}\n---\n\n"
+        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body[:2000]}\n\n"
+        f"--- Design Guide ---\n{ctx.design_plan}\n---\n\n"
         "Generate the implementation code for the above design. "
         "Output ONLY code: file paths, code snippets, function signatures, and imports."
     )
@@ -994,22 +998,13 @@ async def step_claude_implement(
     prompt = (
         f"Read .claude/CLAUDE.md first and follow the defined pipeline. "
         f"Then read GitHub issue #{ctx.issue_num} with `gh issue view {ctx.issue_num}`. "
-        f"\n\n--- Design Guide (from Opus) ---\n{ctx.design_doc}\n---\n"
+        f"\n\n--- Design Guide ---\n{ctx.design_plan}\n---\n"
         f"{qwen_section}\n"
-        f"Implement the solution following this design guide using TDD:\n"
-        f"1. Write failing tests FIRST that define the expected behavior\n"
-        f"2. Run the tests to confirm they fail\n"
-        f"3. Implement the minimum code to make the tests pass\n"
-        f"4. Run the tests again to confirm they pass\n"
-        f"5. Refactor if needed while keeping tests green\n"
-        f"IMPORTANT: After implementation, run the project's compile/build command "
-        f"AND the full test suite to verify everything passes. "
-        f"Fix any failures before proceeding.\n\n"
-        f"GIT RESTRICTIONS (OVERRIDE CLAUDE.md Section 6):\n"
-        f"- Do NOT create any branches. You are already on the correct branch.\n"
-        f"- Do NOT run git push.\n"
-        f"- Do NOT run gh pr create.\n"
-        f"- Only commit your changes locally. Branch management and PR creation are handled externally."
+        f"Implement the solution following TDD (tests first, then code). "
+        f"Run compile/build and full test suite before finishing.\n\n"
+        f"GIT RESTRICTIONS:\n"
+        f"- Do NOT create branches, push, or create PRs.\n"
+        f"- Only commit locally."
     )
 
     if ctx.draft_context_diff:
@@ -1023,7 +1018,8 @@ async def step_claude_implement(
         )
 
     proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", "--dangerously-skip-permissions",
+        "claude", "-p", "--model", settings.sonnet_model,
+        "--dangerously-skip-permissions",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -1280,8 +1276,7 @@ async def step_ai_audit(
             # ── Standard audit: diff fits in context ──
             user_content = (
                 f"## Original Intent\n"
-                f"Issue #{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body}\n\n"
-                f"## Design Document\n{ctx.design_doc}\n\n"
+                f"Issue #{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body[:1000]}\n\n"
                 f"## Implementation Diff\n{ctx.git_diff}\n\n"
             )
             if ctx.review_report:
@@ -1675,11 +1670,12 @@ async def step_opus_design(
             progress_cb=progress_cb,
             step_name=f"{model_label} Design",
             cwd=ctx.project_path,
+            max_turns=3,
         )
         ctx.design_doc = output
 
-        # Extract acceptance criteria (Sprint Contract) from design doc
-        _extract_acceptance_criteria(ctx)
+        # Split design into Section A (plan) and Section B (criteria)
+        _extract_design_sections(ctx)
 
         step.status = "passed"
         step.detail = f"{len(output)} chars, {len(ctx.acceptance_criteria)} chars criteria"
@@ -1691,27 +1687,32 @@ async def step_opus_design(
         step.elapsed_sec = time.monotonic() - start
 
 
-def _extract_acceptance_criteria(ctx: PipelineContext) -> None:
-    """Extract acceptance criteria section from design doc into ctx.acceptance_criteria."""
+def _extract_design_sections(ctx: PipelineContext) -> None:
+    """Split design doc into Section A (plan) and Section B (acceptance criteria)."""
     doc = ctx.design_doc
-    # Try to find Section B marker
-    markers = ["## SECTION B:", "## Acceptance Criteria", "### Acceptance Criteria",
-               "## Sprint Contract", "### Sprint Contract"]
-    start_idx = -1
-    for marker in markers:
+
+    # Find Section B marker
+    b_markers = ["## SECTION B:", "## Acceptance Criteria", "### Acceptance Criteria",
+                 "## Sprint Contract", "### Sprint Contract"]
+    b_start = -1
+    for marker in b_markers:
         idx = doc.lower().find(marker.lower())
         if idx != -1:
-            start_idx = idx
+            b_start = idx
             break
 
-    if start_idx == -1:
-        # Fallback: extract all checkbox lines
+    if b_start == -1:
+        # No Section B found — whole doc is the plan, extract checkbox lines as criteria
+        ctx.design_plan = doc
         lines = [l.strip() for l in doc.splitlines() if l.strip().startswith("- [ ]")]
         ctx.acceptance_criteria = "\n".join(lines) if lines else ""
         return
 
-    # Extract from marker to next major section or end
-    remainder = doc[start_idx:]
+    # Section A = everything before Section B
+    ctx.design_plan = doc[:b_start].strip()
+
+    # Section B = from marker to next major section or end
+    remainder = doc[b_start:]
     lines = remainder.splitlines()
     criteria_lines = [lines[0]]  # header
     for line in lines[1:]:
@@ -1819,8 +1820,7 @@ async def step_sonnet_self_review(
         )
 
     prompt = (
-        f"You are reviewing and IMPROVING code you just wrote for GitHub issue #{ctx.issue_num}.\n\n"
-        f"--- Issue ---\n{ctx.issue_body}\n\n"
+        f"You are reviewing and IMPROVING code you just wrote for GitHub issue #{ctx.issue_num}: {ctx.issue_title}\n\n"
         f"{criteria_section}\n"
         f"--- Current Git Diff ---\n{ctx.git_diff}\n\n"
         f"Your job is to FIND AND FIX problems, not to judge. Do NOT output any verdict.\n\n"
@@ -1841,6 +1841,7 @@ async def step_sonnet_self_review(
         proc = await asyncio.create_subprocess_exec(
             "claude", "-p", "--model", settings.sonnet_model,
             "--output-format", "text", "--dangerously-skip-permissions",
+            "--max-turns", "10",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1939,7 +1940,7 @@ async def step_gemini_cross_review(
         )
 
     user_content = (
-        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
+        f"GitHub Issue #{ctx.issue_num}: {ctx.issue_title}\n{ctx.issue_body[:2000]}\n\n"
         f"--- Git Diff ---\n{ctx.git_diff}\n"
         f"{review_context}"
         f"{criteria_section}\n"
@@ -2005,9 +2006,8 @@ async def step_data_mining_fivebrid(
         "Output ONLY valid JSONL lines. No markdown fences. No explanations."
     )
     user_content = (
-        f"GitHub Issue #{ctx.issue_num} (project: {ctx.project_name}):\n{ctx.issue_body}\n\n"
-        f"--- Research Background ---\n{ctx.research_log}\n\n"
-        f"--- Design Document ---\n{ctx.design_doc}\n\n"
+        f"GitHub Issue #{ctx.issue_num} (project: {ctx.project_name}):\n{ctx.issue_body[:2000]}\n\n"
+        f"--- Design Intent ---\n{ctx.design_plan[:1000]}\n\n"
         f"--- Final Git Diff ---\n{ctx.git_diff}\n\n"
         "Generate instruction-output pairs as JSONL. Bundle the research background, "
         "design intent, and final code into cohesive training examples."
