@@ -1729,17 +1729,24 @@ async def step_gemini_design_critique(
     start = time.monotonic()
 
     system_prompt = (
-        "You are a design reviewer. Evaluate the implementation plan critically. "
-        "Check for: architectural soundness, missing edge cases, security concerns, "
-        "and adherence to the issue requirements."
+        "You are a pragmatic design reviewer. Your goal is to catch fatal flaws, "
+        "not to demand perfection. A good-enough design that can be implemented "
+        "is better than endless revision cycles."
     )
     user_content = (
         f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
         f"--- Design Document ---\n{ctx.design_doc}\n\n"
-        f"Review this design. End your review with exactly one of:\n"
-        f"[DESIGN: APPROVED] — if the design is solid\n"
-        f"[DESIGN: NEEDS_REVISION] — if there are critical issues\n\n"
-        f"If NEEDS_REVISION, clearly list what must be changed."
+        f"Review this design. Apply these rules strictly:\n\n"
+        f"[DESIGN: NEEDS_REVISION] — ONLY if there are BLOCKING issues:\n"
+        f"  - Wrong architecture that will fail at runtime\n"
+        f"  - Missing critical requirements from the issue\n"
+        f"  - Security vulnerabilities\n\n"
+        f"[DESIGN: APPROVED] — for everything else, including:\n"
+        f"  - Design is implementable and covers the issue requirements\n"
+        f"  - Minor improvements, style preferences, alternative approaches\n"
+        f"  - Edge cases that can be caught in code review later\n\n"
+        f"List any suggestions, but default to APPROVED unless there is a "
+        f"blocking flaw. End with exactly one of [DESIGN: APPROVED] or [DESIGN: NEEDS_REVISION]."
     )
 
     messages = [Message(role=Role.USER, content=user_content)]
