@@ -43,6 +43,8 @@ async def run_all(settings: Settings) -> None:
     server = uvicorn.Server(config)
 
     async with telegram_app:
+        if telegram_app.post_init:
+            await telegram_app.post_init(telegram_app)
         await telegram_app.start()
         await telegram_app.updater.start_polling()
 
