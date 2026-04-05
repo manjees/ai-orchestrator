@@ -54,53 +54,18 @@ async def _bg_solve(
     cancel_events: dict[int, asyncio.Event],
 ) -> None:
     """Background task: solve one or more issues via the fivebrid pipeline."""
-    from orchestrator.ai.gemini_provider import GeminiCLIProvider
-    from orchestrator.ai.ollama_provider import OllamaProvider
-    from orchestrator.pipeline import PipelineContext, run_fivebrid_pipeline
+    from orchestrator.core_commands import core_solve
 
-    from . import registry
-
-    async def _noop_progress(msg: str) -> None:
-        logger.debug("[api/solve] %s", msg)
-
-    resolved_mode = solve_mode or "standard"
-
-    async def _solve_one(issue_num: int) -> None:
-        cancel_event = cancel_events[issue_num]
-        branch_name = f"solve/issue-{issue_num}"
-        ctx = PipelineContext(
-            project_path=project_path,
-            project_name=project_name,
-            issue_num=issue_num,
-            branch_name=branch_name,
-            mode=resolved_mode,
+    try:
+        await core_solve(
+            project_name, project_path, project_info,
+            issue_nums, solve_mode, parallel, settings, cancel_events,
         )
-        registry.register(ctx)
-        ollama = OllamaProvider(
-            base_url=settings.ollama_base_url,
-            model=settings.reasoning_model,
-        )
-        gemini = GeminiCLIProvider()
-        try:
-            await asyncio.wait_for(
-                run_fivebrid_pipeline(
-                    ctx, ollama, gemini, settings, cancel_event, _noop_progress,
-                    project_info=project_info,
-                ),
-                timeout=settings.solve_timeout,
-            )
-        except Exception:
-            logger.exception("API solve error for %s#%d", project_name, issue_num)
-        finally:
-            registry.unregister(project_name, issue_num)
-            _api_cancel_events.pop(f"{project_name}_{issue_num}", None)
-            await ollama.close()
-
-    if parallel and len(issue_nums) > 1:
-        await asyncio.gather(*[_solve_one(n) for n in issue_nums], return_exceptions=True)
-    else:
+    except Exception:
+        pass  # core_solve already logs
+    finally:
         for num in issue_nums:
-            await _solve_one(num)
+            _api_cancel_events.pop(f"{project_name}_{num}", None)
 
 
 async def _bg_retry(
@@ -108,50 +73,21 @@ async def _bg_retry(
     project_path: str,
     project_info: dict,
     issue_num: int,
-    pipeline_mode: str,
-    resume_from_step: int,
     settings,
     cancel_event: asyncio.Event,
 ) -> None:
     """Background task: retry a pipeline from a saved checkpoint."""
-    from orchestrator.ai.gemini_provider import GeminiCLIProvider
-    from orchestrator.ai.ollama_provider import OllamaProvider
-    from orchestrator.checkpoint import load_checkpoint, restore_context
-    from orchestrator.pipeline import PipelineContext, run_fivebrid_pipeline
+    from orchestrator.core_commands import core_retry
 
-    from . import registry
-
-    async def _noop_progress(msg: str) -> None:
-        logger.debug("[api/retry] %s", msg)
-
-    cp_data = load_checkpoint(project_name, issue_num)
-    if not cp_data or "ctx" not in cp_data:
-        logger.warning("Retry: checkpoint lost for %s#%d", project_name, issue_num)
-        return
-
-    ctx = restore_context(cp_data["ctx"])
-    registry.register(ctx)
-
-    ollama = OllamaProvider(
-        base_url=settings.ollama_base_url,
-        model=settings.reasoning_model,
-    )
-    gemini = GeminiCLIProvider()
     try:
-        await asyncio.wait_for(
-            run_fivebrid_pipeline(
-                ctx, ollama, gemini, settings, cancel_event, _noop_progress,
-                project_info=project_info,
-                resume_from_step=resume_from_step,
-            ),
-            timeout=settings.solve_timeout,
+        await core_retry(
+            project_name, project_path, project_info,
+            issue_num, settings, cancel_event,
         )
     except Exception:
-        logger.exception("API retry error for %s#%d", project_name, issue_num)
+        pass  # core_retry already logs
     finally:
-        registry.unregister(project_name, issue_num)
         _api_cancel_events.pop(f"{project_name}_{issue_num}", None)
-        await ollama.close()
 
 
 async def _bg_init(
@@ -393,25 +329,19 @@ async def _bg_shell(
     settings,
 ) -> None:
     """Background task: execute a shell command."""
-    from orchestrator.security import mask_secrets
+    from orchestrator.core_commands import core_shell
 
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        output = stdout.decode(errors="replace") if stdout else "(no output)"
-        output = mask_secrets(output)
-        logger.info(
-            "API shell command completed (exit=%d): %s",
-            proc.returncode or 0,
-            command[:80],
-        )
-        logger.debug("API shell output: %s", output[:500])
-    except asyncio.TimeoutError:
-        logger.warning("API shell command timed out after %ds: %s", timeout, command[:80])
+        result = await core_shell(command, timeout)
+        if result.timed_out:
+            logger.warning("API shell command timed out after %ds: %s", timeout, command[:80])
+        else:
+            logger.info(
+                "API shell command completed (exit=%d): %s",
+                result.exit_code,
+                command[:80],
+            )
+            logger.debug("API shell output: %s", result.output[:500])
     except Exception:
         logger.exception("API shell error for command: %s", command[:80])
 
@@ -483,7 +413,6 @@ async def retry(req: RetryRequest, request: Request):
     command_id = generate_command_id()
     project_path = projects[project_name]["path"]
     project_info = projects[project_name]
-    pipeline_mode = cp_data.get("pipeline_mode", "standard")
     resume_from_step = cp_data.get("failed_step_index", -1)
 
     pid = f"{project_name}_{req.issue_num}"
@@ -493,8 +422,7 @@ async def retry(req: RetryRequest, request: Request):
     asyncio.create_task(
         _bg_retry(
             project_name, project_path, project_info,
-            req.issue_num, pipeline_mode, resume_from_step,
-            settings, cancel_event,
+            req.issue_num, settings, cancel_event,
         )
     )
 
