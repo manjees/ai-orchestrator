@@ -14,3 +14,4 @@ build-tools/
 platforms/
 licenses/
 .knownPackages
+data/events.jsonl
