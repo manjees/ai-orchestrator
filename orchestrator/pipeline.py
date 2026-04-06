@@ -431,7 +431,7 @@ def build_fivebrid_steps(mode: str, ci_commands: list[str]) -> list[PipelineStep
     allowed = mode_config["steps"]  # None = all
 
     all_steps = [
-        "Gemini Research",
+        "Haiku Research",
         "Opus Design",
         "Gemini Design Critique",
         "Qwen Hints",
@@ -1564,6 +1564,48 @@ def _write_training_data(ctx: PipelineContext, settings: Settings) -> tuple[int,
 
 # ── Fivebrid Step Functions ───────────────────────────────────────────────────
 
+async def step_haiku_research(
+    ctx: PipelineContext,
+    settings: Settings,
+    progress_cb: ProgressCallback,
+    step_index: int = 0,
+) -> None:
+    """Step 0: Haiku investigates the issue and explores existing code patterns."""
+    step = ctx.steps[step_index]
+    step.status = "running"
+    start = time.monotonic()
+
+    prompt = (
+        f"You are a research assistant preparing context for a senior engineer.\n\n"
+        f"GitHub Issue #{ctx.issue_num}:\n{ctx.issue_body}\n\n"
+        f"Tasks:\n"
+        f"1. Summarize the issue requirements clearly.\n"
+        f"2. Identify which files, modules, and patterns in this project are most relevant.\n"
+        f"3. Note any existing similar patterns in the codebase that could be reused.\n"
+        f"4. Flag potential pitfalls or edge cases.\n\n"
+        f"Be concise and actionable. Focus on facts, not opinions."
+    )
+
+    try:
+        output = await _call_claude_cli_with_progress(
+            prompt,
+            model=settings.haiku_model,
+            timeout=settings.triage_timeout,
+            progress_cb=progress_cb,
+            step_name="Haiku Research",
+            cwd=ctx.project_path,
+        )
+        ctx.research_log = output
+        step.status = "passed"
+        step.detail = f"{len(output)} chars"
+    except Exception as exc:
+        step.status = "failed"
+        step.detail = _exc_detail(exc)
+        raise
+    finally:
+        step.elapsed_sec = time.monotonic() - start
+
+
 async def step_gemini_research(
     ctx: PipelineContext,
     settings: Settings,
@@ -2112,15 +2154,22 @@ async def run_fivebrid_pipeline(
             return "skipped", "Cancelled by user"
 
         # ── Phase 0: Research ──
-        research_idx = _find_step("Gemini Research")
+        research_idx = _find_step("Haiku Research")
+        if research_idx is None:
+            research_idx = _find_step("Gemini Research")
+            research_step_name = "Gemini Research"
+            research_fn = step_gemini_research
+        else:
+            research_step_name = "Haiku Research"
+            research_fn = step_haiku_research
         if research_idx is not None:
             if _step_done(research_idx):
-                await progress_cb(f"[{research_idx}/{total_steps}] Gemini Research (cached)")
+                await progress_cb(f"[{research_idx}/{total_steps}] {research_step_name} (cached)")
             else:
-                await progress_cb(f"[{research_idx}/{total_steps}] Gemini Research...")
-                await _notify_step(dashboard_client, "Gemini Research", "RUNNING", ctx=ctx)
-                await step_gemini_research(ctx, settings, progress_cb, step_index=research_idx)
-                await _notify_step(dashboard_client, "Gemini Research", "IDLE", ctx=ctx)
+                await progress_cb(f"[{research_idx}/{total_steps}] {research_step_name}...")
+                await _notify_step(dashboard_client, research_step_name, "RUNNING", ctx=ctx)
+                await research_fn(ctx, settings, progress_cb, step_index=research_idx)
+                await _notify_step(dashboard_client, research_step_name, "IDLE", ctx=ctx)
 
             if cancel_event.is_set():
                 return "skipped", "Cancelled by user"
