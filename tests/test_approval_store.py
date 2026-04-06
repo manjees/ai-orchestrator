@@ -233,3 +233,58 @@ def test_list_pending_includes_supreme_court_type():
     pending = approval_store.list_pending()
     assert len(pending) == 1
     assert pending[0].type == ApprovalType.SUPREME_COURT
+
+
+# ── T24: respond() is idempotent — second call never overwrites first ─────────
+
+@pytest.mark.asyncio
+async def test_respond_sequential_second_does_not_overwrite():
+    """T24: Sequential respond() calls — second call cannot overwrite the first."""
+    approval_store.create_approval("key1", "strategy", ["approve", "cancel"])
+    r1 = approval_store.respond("key1", "approve")
+    r2 = approval_store.respond("key1", "cancel")
+
+    assert r1 is True
+    assert r2 is False
+    approval = approval_store.get_approval("key1")
+    assert approval is not None
+    assert approval.decision == "approve"
+    assert approval.status == "decided"
+
+
+# ── T25: respond() atomicity — status check and event.set() are contiguous ───
+
+@pytest.mark.asyncio
+async def test_respond_atomicity_no_intermediate_state():
+    """T25: After respond() returns True, approval is fully decided (event set)."""
+    approval_store.create_approval("key1", "strategy", ["approve"])
+    result = approval_store.respond("key1", "approve")
+
+    assert result is True
+    approval = approval_store.get_approval("key1")
+    assert approval is not None
+    # Both status and event must be set atomically — no partial state
+    assert approval.status == "decided"
+    assert approval.event.is_set()
+    assert approval.decision == "approve"
+
+
+# ── T26: wait_for_decision + respond from a different task ───────────────────
+
+@pytest.mark.asyncio
+async def test_wait_for_decision_responds_from_different_task():
+    """T26: event fires correctly when respond() called from separate asyncio task."""
+    approval_store.create_approval("key1", "strategy", ["approve", "cancel"])
+
+    async def responder():
+        await asyncio.sleep(0.03)
+        approval_store.respond("key1", "cancel")
+
+    task = asyncio.create_task(responder())
+    decision = await approval_store.wait_for_decision("key1", timeout=2.0)
+    await task
+
+    assert decision == "cancel"
+    approval = approval_store.get_approval("key1")
+    assert approval is not None
+    assert approval.status == "decided"
