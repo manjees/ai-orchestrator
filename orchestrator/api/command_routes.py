@@ -38,6 +38,9 @@ command_router = APIRouter(prefix="/api/commands", tags=["commands"])
 # Cancel events for API-initiated pipeline tasks: pipeline_id → asyncio.Event
 _api_cancel_events: dict[str, asyncio.Event] = {}
 
+# Lock to make project-name check-then-reserve atomic in /init
+_project_creation_lock = asyncio.Lock()
+
 
 # ── Background task stubs ─────────────────────────────────────────────────────
 # These are named functions so tests can patch them cleanly.
@@ -283,40 +286,111 @@ async def _bg_rebase(
     import json as _json
 
     try:
-        # Get branch name from PR
+        # Fetch PR metadata: branch name and whether it's from a fork.
         proc = await asyncio.create_subprocess_exec(
-            "gh", "pr", "view", str(pr_number), "--json", "headRefName",
+            "gh", "pr", "view", str(pr_number),
+            "--json", "headRefName,isCrossRepository,headRepository",
             cwd=project_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode != 0:
-            logger.error("API rebase: gh pr view failed for #%d", pr_number)
+            logger.error(
+                "API rebase: gh pr view failed for #%d (exit=%d): %s",
+                pr_number, proc.returncode,
+                stdout.decode(errors="replace")[:500] if stdout else "",
+            )
             return
 
-        pr_info = _json.loads(stdout.decode(errors="replace"))
-        branch_name = pr_info["headRefName"]
+        try:
+            pr_info = _json.loads(stdout.decode(errors="replace"))
+        except _json.JSONDecodeError as exc:
+            logger.error("API rebase: failed to parse gh pr view output for #%d: %s", pr_number, exc)
+            return
 
-        # Import and call the same rebase logic from handlers
-        from orchestrator.handlers import _rebase_pr as _tg_rebase_pr  # noqa: F401
-        # We call the git operations directly since _rebase_pr needs Telegram objects.
-        # A simplified rebase: fetch + rebase onto origin/main + push.
-        for git_cmd in [
+        branch_name = pr_info.get("headRefName")
+        if not branch_name:
+            logger.error("API rebase: could not determine head branch for #%d", pr_number)
+            return
+
+        is_fork = pr_info.get("isCrossRepository", False)
+        if is_fork:
+            head_repo = (pr_info.get("headRepository") or {}).get("nameWithOwner", "<unknown>")
+            logger.error(
+                "API rebase: PR #%d is from a fork (%s). "
+                "Rebasing fork branches is not supported — push access is required.",
+                pr_number, head_repo,
+            )
+            return
+
+        if cancel_event.is_set():
+            return
+
+        # fetch + checkout + rebase onto origin/main + force-push
+        pre_rebase_steps = [
             ["git", "fetch", "origin", "main", branch_name],
-        ]:
-            proc = await asyncio.create_subprocess_exec(
+            ["git", "checkout", branch_name],
+        ]
+        post_rebase_steps = [
+            ["git", "push", "--force-with-lease", "origin", branch_name],
+        ]
+
+        async def _run_git(git_cmd: list[str], timeout: int = 60) -> bool:
+            p = await asyncio.create_subprocess_exec(
                 *git_cmd,
                 cwd=project_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode != 0:
-                logger.error("API rebase git command failed: %s", " ".join(git_cmd))
+            out, _ = await asyncio.wait_for(p.communicate(), timeout=timeout)
+            if p.returncode != 0:
+                logger.error(
+                    "API rebase git command failed (exit=%d): %s\n%s",
+                    p.returncode, " ".join(git_cmd),
+                    out.decode(errors="replace")[:500] if out else "",
+                )
+                return False
+            return True
+
+        for git_cmd in pre_rebase_steps:
+            if cancel_event.is_set():
+                logger.info("API rebase: cancelled before %s", git_cmd[1])
+                return
+            if not await _run_git(git_cmd):
                 return
 
-        logger.info("API rebase: %s#%d (%s) started", project_name, pr_number, branch_name)
+        # Run rebase with timeout; abort if it hangs (conflict) or fails.
+        if cancel_event.is_set():
+            logger.info("API rebase: cancelled before rebase")
+            return
+        rebase_ok = False
+        try:
+            rebase_ok = await _run_git(["git", "rebase", "origin/main"], timeout=120)
+        except asyncio.TimeoutError:
+            logger.error("API rebase: git rebase timed out for %s#%d — aborting", project_name, pr_number)
+        if not rebase_ok:
+            # Clean up any in-progress rebase state.
+            try:
+                abort_proc = await asyncio.create_subprocess_exec(
+                    "git", "rebase", "--abort",
+                    cwd=project_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await asyncio.wait_for(abort_proc.communicate(), timeout=15)
+            except Exception:
+                logger.warning("API rebase: git rebase --abort failed for %s#%d", project_name, pr_number)
+            return
+
+        for git_cmd in post_rebase_steps:
+            if cancel_event.is_set():
+                logger.info("API rebase: cancelled before %s", git_cmd[1])
+                return
+            if not await _run_git(git_cmd):
+                return
+
+        logger.info("API rebase: %s#%d (%s) completed", project_name, pr_number, branch_name)
     except Exception:
         logger.exception("API rebase error for %s#%d", project_name, pr_number)
     finally:
@@ -464,11 +538,14 @@ async def init(req: InitRequest, request: Request):
     if not settings.github_user:
         raise HTTPException(status_code=400, detail="GITHUB_USER is not configured")
 
-    if req.name in projects:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Project '{req.name}' already exists",
-        )
+    async with _project_creation_lock:
+        if req.name in projects:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Project '{req.name}' already exists",
+            )
+        # Reserve the name immediately so concurrent requests see a 409.
+        projects[req.name] = {"name": req.name, "status": "initializing"}
 
     command_id = generate_command_id()
     base_dir = os.path.expanduser(settings.projects_base_dir)
