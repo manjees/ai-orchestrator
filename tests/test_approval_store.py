@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from orchestrator import approval_store
+from orchestrator.approval_store import ApprovalStatus, ApprovalType, make_approval_id
 
 
 @pytest.fixture(autouse=True)
@@ -162,3 +163,73 @@ async def test_list_pending_excludes_expired():
     pending = approval_store.list_pending()
     ids = [a.approval_id for a in pending]
     assert "expiring_key" not in ids
+
+
+# ── T16: ApprovalType enum has expected members ───────────────────────────────
+
+def test_approval_type_enum_members():
+    assert ApprovalType.STRATEGY == "strategy"
+    assert ApprovalType.SUPREME_COURT == "supreme_court"
+
+
+# ── T17: ApprovalStatus enum has expected members ────────────────────────────
+
+def test_approval_status_enum_members():
+    assert ApprovalStatus.PENDING == "pending"
+    assert ApprovalStatus.DECIDED == "decided"
+    assert ApprovalStatus.EXPIRED == "expired"
+
+
+# ── T18: make_approval_id produces expected format ───────────────────────────
+
+def test_make_approval_id_format():
+    result = make_approval_id(chat_id=123, issue_num=42)
+    assert result == "123:42"
+
+
+# ── T19: make_approval_id with prefix ────────────────────────────────────────
+
+def test_make_approval_id_with_prefix():
+    result = make_approval_id(chat_id=123, issue_num=42, prefix="court")
+    assert result == "court:123:42"
+
+
+# ── T20: create_approval with ApprovalType enum ──────────────────────────────
+
+def test_create_approval_accepts_enum_type():
+    approval = approval_store.create_approval(
+        "key1", ApprovalType.SUPREME_COURT, ["uphold", "overturn"]
+    )
+    assert approval.type == ApprovalType.SUPREME_COURT
+
+
+# ── T21: Approval status transitions use enum ────────────────────────────────
+
+def test_respond_sets_decided_status_enum():
+    approval_store.create_approval("key1", ApprovalType.STRATEGY, ["approve"])
+    approval_store.respond("key1", "approve")
+    approval = approval_store.get_approval("key1")
+    assert approval.status == ApprovalStatus.DECIDED
+
+
+# ── T22: wait_for_decision timeout sets expired enum ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_wait_timeout_sets_expired_status_enum():
+    approval_store.create_approval("key1", ApprovalType.STRATEGY, ["approve"])
+    await approval_store.wait_for_decision("key1", timeout=0.01)
+    approval = approval_store.get_approval("key1")
+    assert approval.status == ApprovalStatus.EXPIRED
+
+
+# ── T23: list_pending works with supreme_court type ──────────────────────────
+
+def test_list_pending_includes_supreme_court_type():
+    approval_store.create_approval(
+        "court:1:5", ApprovalType.SUPREME_COURT,
+        ["accept", "uphold", "overturn"],
+        context={"ruling": "UPHOLD"},
+    )
+    pending = approval_store.list_pending()
+    assert len(pending) == 1
+    assert pending[0].type == ApprovalType.SUPREME_COURT
