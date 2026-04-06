@@ -38,6 +38,9 @@ command_router = APIRouter(prefix="/api/commands", tags=["commands"])
 # Cancel events for API-initiated pipeline tasks: pipeline_id → asyncio.Event
 _api_cancel_events: dict[str, asyncio.Event] = {}
 
+# Lock to make project-name check-then-reserve atomic in /init
+_project_creation_lock = asyncio.Lock()
+
 
 # ── Background task stubs ─────────────────────────────────────────────────────
 # These are named functions so tests can patch them cleanly.
@@ -54,53 +57,18 @@ async def _bg_solve(
     cancel_events: dict[int, asyncio.Event],
 ) -> None:
     """Background task: solve one or more issues via the fivebrid pipeline."""
-    from orchestrator.ai.gemini_provider import GeminiCLIProvider
-    from orchestrator.ai.ollama_provider import OllamaProvider
-    from orchestrator.pipeline import PipelineContext, run_fivebrid_pipeline
+    from orchestrator.core_commands import core_solve
 
-    from . import registry
-
-    async def _noop_progress(msg: str) -> None:
-        logger.debug("[api/solve] %s", msg)
-
-    resolved_mode = solve_mode or "standard"
-
-    async def _solve_one(issue_num: int) -> None:
-        cancel_event = cancel_events[issue_num]
-        branch_name = f"solve/issue-{issue_num}"
-        ctx = PipelineContext(
-            project_path=project_path,
-            project_name=project_name,
-            issue_num=issue_num,
-            branch_name=branch_name,
-            mode=resolved_mode,
+    try:
+        await core_solve(
+            project_name, project_path, project_info,
+            issue_nums, solve_mode, parallel, settings, cancel_events,
         )
-        registry.register(ctx)
-        ollama = OllamaProvider(
-            base_url=settings.ollama_base_url,
-            model=settings.reasoning_model,
-        )
-        gemini = GeminiCLIProvider()
-        try:
-            await asyncio.wait_for(
-                run_fivebrid_pipeline(
-                    ctx, ollama, gemini, settings, cancel_event, _noop_progress,
-                    project_info=project_info,
-                ),
-                timeout=settings.solve_timeout,
-            )
-        except Exception:
-            logger.exception("API solve error for %s#%d", project_name, issue_num)
-        finally:
-            registry.unregister(project_name, issue_num)
-            _api_cancel_events.pop(f"{project_name}_{issue_num}", None)
-            await ollama.close()
-
-    if parallel and len(issue_nums) > 1:
-        await asyncio.gather(*[_solve_one(n) for n in issue_nums], return_exceptions=True)
-    else:
+    except Exception:
+        pass  # core_solve already logs
+    finally:
         for num in issue_nums:
-            await _solve_one(num)
+            _api_cancel_events.pop(f"{project_name}_{num}", None)
 
 
 async def _bg_retry(
@@ -108,50 +76,21 @@ async def _bg_retry(
     project_path: str,
     project_info: dict,
     issue_num: int,
-    pipeline_mode: str,
-    resume_from_step: int,
     settings,
     cancel_event: asyncio.Event,
 ) -> None:
     """Background task: retry a pipeline from a saved checkpoint."""
-    from orchestrator.ai.gemini_provider import GeminiCLIProvider
-    from orchestrator.ai.ollama_provider import OllamaProvider
-    from orchestrator.checkpoint import load_checkpoint, restore_context
-    from orchestrator.pipeline import PipelineContext, run_fivebrid_pipeline
+    from orchestrator.core_commands import core_retry
 
-    from . import registry
-
-    async def _noop_progress(msg: str) -> None:
-        logger.debug("[api/retry] %s", msg)
-
-    cp_data = load_checkpoint(project_name, issue_num)
-    if not cp_data or "ctx" not in cp_data:
-        logger.warning("Retry: checkpoint lost for %s#%d", project_name, issue_num)
-        return
-
-    ctx = restore_context(cp_data["ctx"])
-    registry.register(ctx)
-
-    ollama = OllamaProvider(
-        base_url=settings.ollama_base_url,
-        model=settings.reasoning_model,
-    )
-    gemini = GeminiCLIProvider()
     try:
-        await asyncio.wait_for(
-            run_fivebrid_pipeline(
-                ctx, ollama, gemini, settings, cancel_event, _noop_progress,
-                project_info=project_info,
-                resume_from_step=resume_from_step,
-            ),
-            timeout=settings.solve_timeout,
+        await core_retry(
+            project_name, project_path, project_info,
+            issue_num, settings, cancel_event,
         )
     except Exception:
-        logger.exception("API retry error for %s#%d", project_name, issue_num)
+        pass  # core_retry already logs
     finally:
-        registry.unregister(project_name, issue_num)
         _api_cancel_events.pop(f"{project_name}_{issue_num}", None)
-        await ollama.close()
 
 
 async def _bg_init(
@@ -347,40 +286,111 @@ async def _bg_rebase(
     import json as _json
 
     try:
-        # Get branch name from PR
+        # Fetch PR metadata: branch name and whether it's from a fork.
         proc = await asyncio.create_subprocess_exec(
-            "gh", "pr", "view", str(pr_number), "--json", "headRefName",
+            "gh", "pr", "view", str(pr_number),
+            "--json", "headRefName,isCrossRepository,headRepository",
             cwd=project_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
         if proc.returncode != 0:
-            logger.error("API rebase: gh pr view failed for #%d", pr_number)
+            logger.error(
+                "API rebase: gh pr view failed for #%d (exit=%d): %s",
+                pr_number, proc.returncode,
+                stdout.decode(errors="replace")[:500] if stdout else "",
+            )
             return
 
-        pr_info = _json.loads(stdout.decode(errors="replace"))
-        branch_name = pr_info["headRefName"]
+        try:
+            pr_info = _json.loads(stdout.decode(errors="replace"))
+        except _json.JSONDecodeError as exc:
+            logger.error("API rebase: failed to parse gh pr view output for #%d: %s", pr_number, exc)
+            return
 
-        # Import and call the same rebase logic from handlers
-        from orchestrator.handlers import _rebase_pr as _tg_rebase_pr  # noqa: F401
-        # We call the git operations directly since _rebase_pr needs Telegram objects.
-        # A simplified rebase: fetch + rebase onto origin/main + push.
-        for git_cmd in [
+        branch_name = pr_info.get("headRefName")
+        if not branch_name:
+            logger.error("API rebase: could not determine head branch for #%d", pr_number)
+            return
+
+        is_fork = pr_info.get("isCrossRepository", False)
+        if is_fork:
+            head_repo = (pr_info.get("headRepository") or {}).get("nameWithOwner", "<unknown>")
+            logger.error(
+                "API rebase: PR #%d is from a fork (%s). "
+                "Rebasing fork branches is not supported — push access is required.",
+                pr_number, head_repo,
+            )
+            return
+
+        if cancel_event.is_set():
+            return
+
+        # fetch + checkout + rebase onto origin/main + force-push
+        pre_rebase_steps = [
             ["git", "fetch", "origin", "main", branch_name],
-        ]:
-            proc = await asyncio.create_subprocess_exec(
+            ["git", "checkout", branch_name],
+        ]
+        post_rebase_steps = [
+            ["git", "push", "--force-with-lease", "origin", branch_name],
+        ]
+
+        async def _run_git(git_cmd: list[str], timeout: int = 60) -> bool:
+            p = await asyncio.create_subprocess_exec(
                 *git_cmd,
                 cwd=project_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode != 0:
-                logger.error("API rebase git command failed: %s", " ".join(git_cmd))
+            out, _ = await asyncio.wait_for(p.communicate(), timeout=timeout)
+            if p.returncode != 0:
+                logger.error(
+                    "API rebase git command failed (exit=%d): %s\n%s",
+                    p.returncode, " ".join(git_cmd),
+                    out.decode(errors="replace")[:500] if out else "",
+                )
+                return False
+            return True
+
+        for git_cmd in pre_rebase_steps:
+            if cancel_event.is_set():
+                logger.info("API rebase: cancelled before %s", git_cmd[1])
+                return
+            if not await _run_git(git_cmd):
                 return
 
-        logger.info("API rebase: %s#%d (%s) started", project_name, pr_number, branch_name)
+        # Run rebase with timeout; abort if it hangs (conflict) or fails.
+        if cancel_event.is_set():
+            logger.info("API rebase: cancelled before rebase")
+            return
+        rebase_ok = False
+        try:
+            rebase_ok = await _run_git(["git", "rebase", "origin/main"], timeout=120)
+        except asyncio.TimeoutError:
+            logger.error("API rebase: git rebase timed out for %s#%d — aborting", project_name, pr_number)
+        if not rebase_ok:
+            # Clean up any in-progress rebase state.
+            try:
+                abort_proc = await asyncio.create_subprocess_exec(
+                    "git", "rebase", "--abort",
+                    cwd=project_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await asyncio.wait_for(abort_proc.communicate(), timeout=15)
+            except Exception:
+                logger.warning("API rebase: git rebase --abort failed for %s#%d", project_name, pr_number)
+            return
+
+        for git_cmd in post_rebase_steps:
+            if cancel_event.is_set():
+                logger.info("API rebase: cancelled before %s", git_cmd[1])
+                return
+            if not await _run_git(git_cmd):
+                return
+
+        logger.info("API rebase: %s#%d (%s) completed", project_name, pr_number, branch_name)
     except Exception:
         logger.exception("API rebase error for %s#%d", project_name, pr_number)
     finally:
@@ -393,25 +403,19 @@ async def _bg_shell(
     settings,
 ) -> None:
     """Background task: execute a shell command."""
-    from orchestrator.security import mask_secrets
+    from orchestrator.core_commands import core_shell
 
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        output = stdout.decode(errors="replace") if stdout else "(no output)"
-        output = mask_secrets(output)
-        logger.info(
-            "API shell command completed (exit=%d): %s",
-            proc.returncode or 0,
-            command[:80],
-        )
-        logger.debug("API shell output: %s", output[:500])
-    except asyncio.TimeoutError:
-        logger.warning("API shell command timed out after %ds: %s", timeout, command[:80])
+        result = await core_shell(command, timeout)
+        if result.timed_out:
+            logger.warning("API shell command timed out after %ds: %s", timeout, command[:80])
+        else:
+            logger.info(
+                "API shell command completed (exit=%d): %s",
+                result.exit_code,
+                command[:80],
+            )
+            logger.debug("API shell output: %s", result.output[:500])
     except Exception:
         logger.exception("API shell error for command: %s", command[:80])
 
@@ -483,7 +487,6 @@ async def retry(req: RetryRequest, request: Request):
     command_id = generate_command_id()
     project_path = projects[project_name]["path"]
     project_info = projects[project_name]
-    pipeline_mode = cp_data.get("pipeline_mode", "standard")
     resume_from_step = cp_data.get("failed_step_index", -1)
 
     pid = f"{project_name}_{req.issue_num}"
@@ -493,8 +496,7 @@ async def retry(req: RetryRequest, request: Request):
     asyncio.create_task(
         _bg_retry(
             project_name, project_path, project_info,
-            req.issue_num, pipeline_mode, resume_from_step,
-            settings, cancel_event,
+            req.issue_num, settings, cancel_event,
         )
     )
 
@@ -536,11 +538,14 @@ async def init(req: InitRequest, request: Request):
     if not settings.github_user:
         raise HTTPException(status_code=400, detail="GITHUB_USER is not configured")
 
-    if req.name in projects:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Project '{req.name}' already exists",
-        )
+    async with _project_creation_lock:
+        if req.name in projects:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Project '{req.name}' already exists",
+            )
+        # Reserve the name immediately so concurrent requests see a 409.
+        projects[req.name] = {"name": req.name, "status": "initializing"}
 
     command_id = generate_command_id()
     base_dir = os.path.expanduser(settings.projects_base_dir)

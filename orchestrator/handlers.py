@@ -225,21 +225,14 @@ async def cmd_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _cmd_simple(update: Update, command: str, timeout: int) -> None:
     """Run command, wait for completion, send output."""
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        output = stdout.decode(errors="replace") if stdout else "(no output)"
-    except asyncio.TimeoutError:
-        proc.kill()  # type: ignore[possibly-undefined]
-        output = f"(command timed out after {timeout}s)"
-    except FileNotFoundError:
-        output = "(command not found)"
+    from orchestrator.core_commands import core_shell
 
-    output = mask_secrets(output)
+    result = await core_shell(command, timeout)
+    if result.timed_out:
+        output = f"(command timed out after {timeout}s)"
+    else:
+        output = result.output
+
     # Truncate to 4000 chars for Telegram message limit
     if len(output) > 4000:
         output = output[-4000:]
