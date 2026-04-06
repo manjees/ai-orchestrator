@@ -792,6 +792,11 @@ async def strategy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             except Exception:
                 pass
             return
+        await _emit_event("approval.responded", {
+            "approval_id": approval_key,
+            "decision": decision,
+            "source": "telegram",
+        })
     except Exception:
         logger.exception("strategy callback error")
 
@@ -1078,6 +1083,12 @@ async def _supreme_court_user_decision(
         decision_options=["accept", "uphold", "overturn"],
         context={"ruling": ruling, "issue_num": ctx.issue_num},
     )
+    await _emit_event("approval.required", {
+        "approval_id": key,
+        "type": "supreme_court",
+        "decision_options": ["accept", "uphold", "overturn"],
+        "context": {"ruling": ruling, "issue_num": ctx.issue_num},
+    })
 
     ruling_emoji = {"UPHOLD": "⚖️", "OVERTURN": "🔄", "REDESIGN": "🏗️"}.get(ruling, "⚖️")
 
@@ -1106,7 +1117,15 @@ async def _supreme_court_user_decision(
 
     try:
         decision = await approval_store.wait_for_decision(key, timeout=settings.supreme_court_user_timeout)
-        if decision is None or decision == "accept":
+        if decision is None:
+            decision = ruling.lower()
+            await _emit_event("approval.responded", {
+                "approval_id": key,
+                "decision": decision,
+                "source": "timeout",
+                "timeout": True,
+            })
+        elif decision == "accept":
             decision = ruling.lower()
     finally:
         approval_store.remove_approval(key)
@@ -1137,7 +1156,11 @@ async def supreme_court_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("Court session expired.")
             return
 
-
+        await _emit_event("approval.responded", {
+            "approval_id": key,
+            "decision": decision,
+            "source": "telegram",
+        })
         await query.edit_message_text(f"Decision: {action.split('_')[1].upper()}")
     except Exception:
         logger.exception("Supreme Court callback error")
@@ -1316,6 +1339,12 @@ async def _solve_with_fivebrid(
                 decision_options=["approve", "nosplit", "cancel"],
                 context={"triage_result": triage_result},
             )
+            await _emit_event("approval.required", {
+                "approval_id": approval_key,
+                "type": "strategy",
+                "decision_options": ["approve", "nosplit", "cancel"],
+                "context": {"triage_result": triage_result},
+            })
 
             buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -1340,6 +1369,12 @@ async def _solve_with_fivebrid(
                 )
                 if decision is None:
                     decision = "approve"
+                    await _emit_event("approval.responded", {
+                        "approval_id": approval_key,
+                        "decision": decision,
+                        "source": "timeout",
+                        "timeout": True,
+                    })
                     await _edit_msg(
                         msg,
                         f"<b>#{issue_num}</b> Strategy approval timed out — auto-proceeding with Haiku recommendation.",
