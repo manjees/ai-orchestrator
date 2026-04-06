@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from orchestrator.approval_store import ApprovalStatus, ApprovalType
+
 
 class ApprovalInfo(BaseModel):
     """Read-only representation of an approval."""
     approval_id: str
-    type: str                            # "strategy" | "supreme_court"
-    status: str = "pending"              # "pending" | "decided" | "expired"
+    type: ApprovalType
+    status: ApprovalStatus = ApprovalStatus.PENDING
     decision: str | None = None
     decision_options: list[str]
     context: dict = {}                   # triage_result, issue_num, etc.

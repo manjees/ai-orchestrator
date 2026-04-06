@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from orchestrator import approval_store
+from orchestrator.approval_store import ApprovalType
 from orchestrator.api.app import create_api_app
 from orchestrator.config import Settings
 
@@ -148,3 +149,24 @@ def test_list_approvals_response_shape(client):
     assert approval["decision"] is None
     assert set(approval["decision_options"]) == {"approve", "nosplit", "cancel"}
     assert approval["context"] == {"issue_num": 99}
+
+
+# ── T22: GET response serializes enum type as string ─────────────────────────
+
+def test_list_approvals_serializes_type_as_string(client):
+    approval_store.create_approval(
+        "court:1:5", ApprovalType.SUPREME_COURT, ["uphold", "overturn"]
+    )
+    resp = client.get("/api/approvals")
+    assert resp.status_code == 200
+    assert resp.json()["approvals"][0]["type"] == "supreme_court"
+
+
+# ── T23: POST respond works for supreme_court approval ───────────────────────
+
+def test_respond_supreme_court_approval(client):
+    approval_store.create_approval(
+        "court:1:5", ApprovalType.SUPREME_COURT, ["uphold", "overturn"]
+    )
+    resp = client.post("/api/approvals/court:1:5/respond", json={"decision": "uphold"})
+    assert resp.status_code == 200

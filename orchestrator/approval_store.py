@@ -4,15 +4,33 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 logger = logging.getLogger(__name__)
+
+
+class ApprovalType(StrEnum):
+    STRATEGY = "strategy"
+    SUPREME_COURT = "supreme_court"
+
+
+class ApprovalStatus(StrEnum):
+    PENDING = "pending"
+    DECIDED = "decided"
+    EXPIRED = "expired"
+
+
+def make_approval_id(chat_id: int, issue_num: int, *, prefix: str = "") -> str:
+    """Generate a deterministic approval key."""
+    base = f"{chat_id}:{issue_num}"
+    return f"{prefix}:{base}" if prefix else base
 
 
 @dataclass
 class Approval:
     approval_id: str
-    type: str                            # "strategy" | "supreme_court"
-    status: str = "pending"              # "pending" | "decided" | "expired"
+    type: ApprovalType
+    status: ApprovalStatus = ApprovalStatus.PENDING
     decision: str | None = None
     decision_options: list[str] = field(default_factory=list)
     context: dict = field(default_factory=dict)
@@ -25,14 +43,14 @@ _approvals: dict[str, Approval] = {}
 
 def create_approval(
     approval_id: str,
-    approval_type: str,
+    approval_type: ApprovalType | str,
     decision_options: list[str],
     context: dict | None = None,
 ) -> Approval:
     """Register a new pending approval. Returns the Approval object."""
     approval = Approval(
         approval_id=approval_id,
-        type=approval_type,
+        type=ApprovalType(approval_type),
         decision_options=decision_options,
         context=context or {},
     )
@@ -52,14 +70,14 @@ def respond(approval_id: str, decision: str) -> bool:
     approval = _approvals.get(approval_id)
     if approval is None:
         return False
-    if approval.status != "pending":
+    if approval.status != ApprovalStatus.PENDING:
         return False
     if decision not in approval.decision_options:
         raise ValueError(
             f"Invalid decision '{decision}'. Must be one of: {approval.decision_options}"
         )
     approval.decision = decision
-    approval.status = "decided"
+    approval.status = ApprovalStatus.DECIDED
     approval.event.set()
     return True
 
@@ -73,7 +91,7 @@ async def wait_for_decision(approval_id: str, timeout: float) -> str | None:
         await asyncio.wait_for(approval.event.wait(), timeout=timeout)
         return approval.decision
     except asyncio.TimeoutError:
-        approval.status = "expired"
+        approval.status = ApprovalStatus.EXPIRED
         return None
 
 
@@ -83,7 +101,7 @@ def remove_approval(approval_id: str) -> None:
 
 
 def list_pending() -> list[Approval]:
-    return [a for a in _approvals.values() if a.status == "pending"]
+    return [a for a in _approvals.values() if a.status == ApprovalStatus.PENDING]
 
 
 def clear_all() -> None:
