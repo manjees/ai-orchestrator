@@ -43,6 +43,7 @@ from .pipeline import (
     step_triage_and_split,
 )
 from .api import registry
+from . import approval_store
 from .security import mask_secrets
 from .system_monitor import get_system_status
 from .tmux_manager import capture_pane, list_sessions
@@ -68,9 +69,6 @@ _discuss_cancels: dict[int, asyncio.Event] = {}
 # Discuss results for [Create Issues] button: message_id → context dict
 _discuss_results: dict[int, dict] = {}
 
-# Strategy approval state for adaptive pipeline
-_strategy_approvals: dict[str, dict] = {}  # approval_key → context dict
-_strategy_events: dict[str, asyncio.Event] = {}  # approval_key → event
 
 # ANSI escape codes: CSI sequences (incl. ?/= private modes), OSC sequences, single ESC codes
 _ANSI_RE = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^[\]()]")
@@ -764,25 +762,28 @@ async def strategy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         action = parts[0]  # strategy_approve | strategy_nosplit | strategy_cancel
         approval_key = parts[1] if len(parts) > 1 else ""
 
-        approval = _strategy_approvals.get(approval_key)
-        if not approval:
+        decision_map = {
+            "strategy_approve": "approve",
+            "strategy_nosplit": "nosplit",
+            "strategy_cancel": "cancel",
+        }
+        decision = decision_map.get(action, "cancel")
+
+        applied = approval_store.respond(approval_key, decision)
+        if not applied:
             try:
-                await query.edit_message_text("Strategy session expired.")
+                approval = approval_store.get_approval(approval_key)
+                message_suffix = "This approval is no longer available."
+                if approval:
+                    if approval.status == "decided" and approval.decision:
+                        message_suffix = f"Decision already made: {approval.decision.upper()}"
+                    else:
+                        message_suffix = f"This approval has {approval.status}."
+                new_text = f"{query.message.text}\n\n{message_suffix}"
+                await query.edit_message_text(text=new_text, reply_markup=None)
             except Exception:
                 pass
             return
-
-        if action == "strategy_approve":
-            approval["decision"] = "approve"
-        elif action == "strategy_nosplit":
-            approval["decision"] = "nosplit"
-        else:
-            approval["decision"] = "cancel"
-
-        # Wake up the waiting coroutine
-        event = _strategy_events.get(approval_key)
-        if event:
-            event.set()
     except Exception:
         logger.exception("strategy callback error")
 
@@ -1309,10 +1310,12 @@ async def _solve_with_fivebrid(
             )
 
             approval_key = f"{chat_id}:{issue_num}"
-            _strategy_approvals[approval_key] = {
-                "triage_result": triage_result,
-                "decision": None,
-            }
+            approval_store.create_approval(
+                approval_id=approval_key,
+                approval_type="strategy",
+                decision_options=["approve", "nosplit", "cancel"],
+                context={"triage_result": triage_result},
+            )
 
             buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -1330,24 +1333,19 @@ async def _solve_with_fivebrid(
             ])
             await _edit_msg(msg, report, reply_markup=buttons)
 
-            # Wait for approval
-            approval_event = asyncio.Event()
-            _strategy_events[approval_key] = approval_event
+            # Wait for approval (Telegram button or API POST)
             try:
-                await asyncio.wait_for(
-                    approval_event.wait(),
-                    timeout=settings.strategy_approval_timeout,
+                decision = await approval_store.wait_for_decision(
+                    approval_key, timeout=settings.strategy_approval_timeout
                 )
-                decision = _strategy_approvals.get(approval_key, {}).get("decision")
-            except asyncio.TimeoutError:
-                decision = "approve"
-                await _edit_msg(
-                    msg,
-                    f"<b>#{issue_num}</b> Strategy approval timed out — auto-proceeding with Haiku recommendation.",
-                )
+                if decision is None:
+                    decision = "approve"
+                    await _edit_msg(
+                        msg,
+                        f"<b>#{issue_num}</b> Strategy approval timed out — auto-proceeding with Haiku recommendation.",
+                    )
             finally:
-                _strategy_approvals.pop(approval_key, None)
-                _strategy_events.pop(approval_key, None)
+                approval_store.remove_approval(approval_key)
 
             if decision == "cancel":
                 await _edit_msg(msg, f"<b>#{issue_num}</b> Cancelled by user.")
