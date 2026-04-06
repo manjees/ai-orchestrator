@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -71,3 +73,27 @@ class ShellRequest(BaseModel):
     command: str = Field(..., min_length=1)
     timeout: int | None = None    # override default timeout
     stream: bool = False
+
+
+# ── Approval models ───────────────────────────────────────────────────────────
+
+
+class ApprovalRespondRequest(BaseModel):
+    decision: str = Field(
+        ...,
+        description="Strategy: approve|nosplit|cancel. Court: uphold|overturn|accept",
+    )
+    comment: str = ""
+
+
+class ApprovalRespondResponse(BaseModel):
+    approval_id: str
+    decision: str
+    status: str = "resolved"
+    message: str = ""
+
+
+class PendingApprovalInfo(BaseModel):
+    approval_id: str
+    approval_type: str          # "strategy" | "supreme_court"
+    context: dict[str, Any]     # issue_num, project, ruling, etc.

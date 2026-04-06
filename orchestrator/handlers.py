@@ -42,9 +42,9 @@ from .pipeline import (
     step_discuss_to_issues,
     step_triage_and_split,
 )
-from .api import registry
 from . import approval_store
 from .approval_store import ApprovalType, make_approval_id
+from .api import registry
 from .security import mask_secrets
 from .system_monitor import get_system_status
 from .tmux_manager import capture_pane, list_sessions
@@ -1136,6 +1136,7 @@ async def supreme_court_callback(update: Update, context: ContextTypes.DEFAULT_T
         if not applied:
             await query.edit_message_text("Court session expired.")
             return
+
 
         await query.edit_message_text(f"Decision: {action.split('_')[1].upper()}")
     except Exception:
