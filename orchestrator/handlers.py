@@ -42,7 +42,10 @@ from .pipeline import (
     step_discuss_to_issues,
     step_triage_and_split,
 )
+from . import approval_store
+from .approval_store import ApprovalType, PendingApproval
 from .api import registry
+from .api.events import EventType, get_event_bus
 from .security import mask_secrets
 from .system_monitor import get_system_status
 from .tmux_manager import capture_pane, list_sessions
@@ -68,9 +71,7 @@ _discuss_cancels: dict[int, asyncio.Event] = {}
 # Discuss results for [Create Issues] button: message_id → context dict
 _discuss_results: dict[int, dict] = {}
 
-# Strategy approval state for adaptive pipeline
-_strategy_approvals: dict[str, dict] = {}  # approval_key → context dict
-_strategy_events: dict[str, asyncio.Event] = {}  # approval_key → event
+# Strategy / Supreme Court approval state is managed via approval_store
 
 # ANSI escape codes: CSI sequences (incl. ?/= private modes), OSC sequences, single ESC codes
 _ANSI_RE = re.compile(r"\x1b\[[^A-Za-z]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[^[\]()]")
@@ -764,25 +765,20 @@ async def strategy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         action = parts[0]  # strategy_approve | strategy_nosplit | strategy_cancel
         approval_key = parts[1] if len(parts) > 1 else ""
 
-        approval = _strategy_approvals.get(approval_key)
-        if not approval:
+        if action == "strategy_approve":
+            decision = "approve"
+        elif action == "strategy_nosplit":
+            decision = "nosplit"
+        else:
+            decision = "cancel"
+
+        resolved = approval_store.resolve(approval_key, decision)
+        if not resolved:
             try:
                 await query.edit_message_text("Strategy session expired.")
             except Exception:
                 pass
             return
-
-        if action == "strategy_approve":
-            approval["decision"] = "approve"
-        elif action == "strategy_nosplit":
-            approval["decision"] = "nosplit"
-        else:
-            approval["decision"] = "cancel"
-
-        # Wake up the waiting coroutine
-        event = _strategy_events.get(approval_key)
-        if event:
-            event.set()
     except Exception:
         logger.exception("strategy callback error")
 
@@ -931,8 +927,6 @@ async def _solve_issues(
 
 # ── Staggered Parallel Solve ────────────────────────────────────────────
 
-_court_approvals: dict[str, dict] = {}
-_court_events: dict[str, asyncio.Event] = {}
 
 
 async def _solve_issues_staggered(
@@ -1067,9 +1061,18 @@ async def _supreme_court_user_decision(
 ) -> str:
     """Show Supreme Court ruling to user and wait for decision."""
     key = f"{chat_id}:{ctx.issue_num}"
-    _court_approvals[key] = {"decision": None}
-    event = asyncio.Event()
-    _court_events[key] = event
+    pending_approval = PendingApproval(
+        approval_id=key,
+        approval_type=ApprovalType.SUPREME_COURT,
+        context={"issue_num": ctx.issue_num, "project": ctx.project_name, "chat_id": chat_id, "ruling": ruling},
+    )
+    approval_store.register(pending_approval)
+    bus = get_event_bus()
+    await bus.emit(EventType.APPROVAL_REQUIRED, {
+        "approval_id": key,
+        "approval_type": pending_approval.approval_type.value,
+        "context": pending_approval.context,
+    })
 
     ruling_emoji = {"UPHOLD": "⚖️", "OVERTURN": "🔄", "REDESIGN": "🏗️"}.get(ruling, "⚖️")
 
@@ -1097,13 +1100,14 @@ async def _supreme_court_user_decision(
     await context.bot.send_message(chat_id, report, parse_mode=ParseMode.HTML, reply_markup=buttons)
 
     try:
-        await asyncio.wait_for(event.wait(), timeout=settings.supreme_court_user_timeout)
-        decision = _court_approvals.get(key, {}).get("decision", ruling.lower())
+        await asyncio.wait_for(pending_approval.event.wait(), timeout=settings.supreme_court_user_timeout)
+        d = pending_approval.decision
+        # "accept" means use Gemini ruling; None also defaults to ruling
+        decision = ruling.lower() if (d is None or d == "accept") else d
     except asyncio.TimeoutError:
         decision = ruling.lower()
     finally:
-        _court_approvals.pop(key, None)
-        _court_events.pop(key, None)
+        approval_store.remove(key)
 
     return decision
 
@@ -1121,21 +1125,19 @@ async def supreme_court_callback(update: Update, context: ContextTypes.DEFAULT_T
         action = parts[0]
         key = parts[1] if len(parts) > 1 else ""
 
-        approval = _court_approvals.get(key)
-        if not approval:
+        if action == "court_accept":
+            decision = "accept"
+        elif action == "court_uphold":
+            decision = "uphold"
+        elif action == "court_overturn":
+            decision = "overturn"
+        else:
+            decision = "accept"
+
+        resolved = approval_store.resolve(key, decision)
+        if not resolved:
             await query.edit_message_text("Court session expired.")
             return
-
-        if action == "court_accept":
-            approval["decision"] = None  # Will default to ruling
-        elif action == "court_uphold":
-            approval["decision"] = "uphold"
-        elif action == "court_overturn":
-            approval["decision"] = "overturn"
-
-        event = _court_events.get(key)
-        if event:
-            event.set()
 
         await query.edit_message_text(f"Decision: {action.split('_')[1].upper()}")
     except Exception:
@@ -1309,10 +1311,18 @@ async def _solve_with_fivebrid(
             )
 
             approval_key = f"{chat_id}:{issue_num}"
-            _strategy_approvals[approval_key] = {
-                "triage_result": triage_result,
-                "decision": None,
-            }
+            pending_approval = PendingApproval(
+                approval_id=approval_key,
+                approval_type=ApprovalType.STRATEGY,
+                context={"issue_num": issue_num, "project": project_name, "chat_id": chat_id},
+            )
+            approval_store.register(pending_approval)
+            bus = get_event_bus()
+            await bus.emit(EventType.APPROVAL_REQUIRED, {
+                "approval_id": approval_key,
+                "approval_type": pending_approval.approval_type.value,
+                "context": pending_approval.context,
+            })
 
             buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -1331,14 +1341,12 @@ async def _solve_with_fivebrid(
             await _edit_msg(msg, report, reply_markup=buttons)
 
             # Wait for approval
-            approval_event = asyncio.Event()
-            _strategy_events[approval_key] = approval_event
             try:
                 await asyncio.wait_for(
-                    approval_event.wait(),
+                    pending_approval.event.wait(),
                     timeout=settings.strategy_approval_timeout,
                 )
-                decision = _strategy_approvals.get(approval_key, {}).get("decision")
+                decision = pending_approval.decision
             except asyncio.TimeoutError:
                 decision = "approve"
                 await _edit_msg(
@@ -1346,8 +1354,7 @@ async def _solve_with_fivebrid(
                     f"<b>#{issue_num}</b> Strategy approval timed out — auto-proceeding with Haiku recommendation.",
                 )
             finally:
-                _strategy_approvals.pop(approval_key, None)
-                _strategy_events.pop(approval_key, None)
+                approval_store.remove(approval_key)
 
             if decision == "cancel":
                 await _edit_msg(msg, f"<b>#{issue_num}</b> Cancelled by user.")
