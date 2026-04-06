@@ -7,6 +7,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from orchestrator.config import Settings
 
+from .approval_routes import approval_router
 from .auth import APIKeyAuthMiddleware
 from .command_routes import command_router
 from .events import get_event_bus
@@ -61,5 +62,6 @@ def create_api_app(
     app.add_middleware(APIKeyAuthMiddleware, api_key=settings.dashboard_api_key)
     app.include_router(router)
     app.include_router(command_router)
+    app.include_router(approval_router)
 
     return app

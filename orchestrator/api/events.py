@@ -22,6 +22,7 @@ class EventType:
     PIPELINE_COMPLETED = "pipeline.completed"
     PIPELINE_FAILED = "pipeline.failed"
     APPROVAL_REQUIRED = "approval.required"
+    APPROVAL_RESPONDED = "approval.responded"
     SYSTEM_STATUS = "system.status"
 
 
