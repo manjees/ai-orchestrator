@@ -171,7 +171,7 @@ After each successful solve, key architectural decisions are extracted and store
 ### Install
 
 ```bash
-git clone https://github.com/yourusername/ai-orchestrator.git
+git clone https://github.com/manjees/ai-orchestrator.git
 cd ai-orchestrator
 uv sync
 ```
