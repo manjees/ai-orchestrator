@@ -67,7 +67,7 @@ class GeminiCLIProvider(AIProvider):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
             output = stdout.decode(errors="replace") if stdout else ""
             return proc.returncode == 0 and len(output.strip()) > 0
         except Exception:

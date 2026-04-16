@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     cmd_timeout: int = 30
     cmd_long_timeout: int = 600
-    solve_timeout: int = 3600  # per-issue timeout (60 min)
+    solve_timeout: int = 5400  # per-issue timeout (90 min)
 
     # Qwen (Hints, Data Mining, /plan, /discuss)
     qwen_model: str = "qwen3.5:35b"
@@ -163,6 +163,9 @@ class Settings(BaseSettings):
 
 def save_projects(projects: dict[str, dict]) -> None:
     """Write projects dict to projects.json, contracting home dir to ~ for portability."""
+    if not projects and _PROJECTS_FILE.exists():
+        logger.warning("Refusing to overwrite projects.json with empty dict")
+        return
     home = str(Path.home())
     out: dict[str, dict] = {}
     for name, info in projects.items():

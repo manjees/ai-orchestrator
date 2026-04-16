@@ -342,7 +342,7 @@ def _resolve_ci_commands(project_path: str, project_info: dict | None) -> list[s
 
 
 async def _stop_gradle_daemon(project_path: str) -> None:
-    """Stop Gradle daemon if gradlew exists to free JVM memory."""
+    """Stop Gradle daemon and kill orphaned workers to free JVM memory."""
     gradlew = Path(project_path) / "gradlew"
     if not gradlew.exists():
         return
@@ -354,6 +354,35 @@ async def _stop_gradle_daemon(project_path: str) -> None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         await asyncio.wait_for(proc.communicate(), timeout=15)
+    except Exception:
+        pass
+    # Kill any orphaned Gradle workers spawned from this project path
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            f"pkill -f 'GradleWorkerMain.*{project_path}' 2>/dev/null; "
+            f"pkill -f 'GradleWrapperMain.*{project_path}' 2>/dev/null; true",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=10)
+    except Exception:
+        pass
+
+
+async def _reap_zombie_gradle(project_path: str) -> None:
+    """Kill Gradle workers that have been running >5 min CPU-bound (likely hung tests)."""
+    try:
+        # Find GradleWorkerMain processes for this project with >5 min CPU time
+        proc = await asyncio.create_subprocess_shell(
+            f"ps -eo pid,cputime,args | grep 'GradleWorkerMain' | grep -v grep | "
+            f"while read pid cput args; do "
+            f"  mins=$(echo $cput | awk -F: '{{print ($1*60)+$2}}'); "
+            f"  if [ \"$mins\" -gt 5 ]; then kill $pid 2>/dev/null; fi; "
+            f"done; true",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=10)
     except Exception:
         pass
 
@@ -538,13 +567,18 @@ async def step_triage_and_split(
             "Rules:\n"
             "- Only split if the issue clearly contains 2+ distinct tasks\n"
             "- Each sub-issue MUST be small enough to implement in ~10 changed files or less\n"
-            "  (Sonnet has a 60-minute timeout — scope each sub-issue to fit within 30 minutes)\n"
+            "  (Sonnet has a 90-minute timeout — scope each sub-issue to fit within 30 minutes)\n"
             "- Sub-issues are executed SEQUENTIALLY and each builds on the previous one's code,\n"
             "  so they do NOT need to be fully independent — order them logically:\n"
             "  e.g., 1) domain models → 2) repository layer → 3) UI components\n"
             "- Do NOT split if the whole issue is already small (≤15 files)\n"
             "- Max 4 sub-issues (fewer is better)\n"
             "- Each sub-issue must be testable on its own (compile + tests pass)\n\n"
+            "KMP (Kotlin Multiplatform) Rule:\n"
+            "- ALWAYS split into at least 2 sub-issues:\n"
+            "  1) shared module: State, ViewModel, Model, Repository + tests\n"
+            "  2) UI: Compose (commonMain) + platform-specific (SwiftUI for iOS)\n"
+            "- Never implement shared logic and UI in the same sub-issue\n\n"
             "If splitting is NOT needed, reply: SPLIT: NO\n\n"
             "If splitting IS needed, reply in this format:\n"
             "SPLIT: YES\n"
@@ -807,15 +841,24 @@ async def _call_claude_cli_with_progress(
     while not task.done():
         await asyncio.sleep(10)
         elapsed += 10
+        if elapsed > timeout:
+            proc.kill()
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            raise TimeoutError(f"{step_name} timed out after {timeout}s")
         mins, secs = divmod(elapsed, 60)
         await progress_cb(f"{step_name} (Thinking... {mins}m {secs}s)")
 
-    stdout, stderr = await asyncio.wait_for(task, timeout=timeout)
+    stdout, stderr = await asyncio.wait_for(task, timeout=10)
     output = stdout.decode(errors="replace") if stdout else ""
 
     if proc.returncode != 0:
         err = stderr.decode(errors="replace") if stderr else ""
-        raise RuntimeError(f"Claude CLI failed (exit={proc.returncode}): {err[:300]}")
+        detail = err[:300] if err.strip() else output[:300]
+        logger.error("Claude CLI exit=%d stderr=%s stdout_head=%s", proc.returncode, err[:200], output[:200])
+        raise RuntimeError(f"Claude CLI failed (exit={proc.returncode}): {detail}")
 
     if not output.strip():
         raise RuntimeError("Claude CLI returned empty response")
@@ -857,10 +900,17 @@ async def _call_gemini_cli_with_progress(
     while not task.done():
         await asyncio.sleep(10)
         elapsed += 10
+        if elapsed > timeout:
+            proc.kill()
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            raise TimeoutError(f"{step_name} timed out after {timeout}s")
         mins, secs = divmod(elapsed, 60)
         await progress_cb(f"{step_name} (Thinking... {mins}m {secs}s)")
 
-    stdout, stderr = await asyncio.wait_for(task, timeout=timeout)
+    stdout, stderr = await asyncio.wait_for(task, timeout=10)
     output = stdout.decode(errors="replace") if stdout else ""
 
     if proc.returncode != 0:
@@ -976,6 +1026,50 @@ async def step_qwen_pre_implement(
         step.elapsed_sec = time.monotonic() - start
 
 
+def _write_harness_workspace(ctx: PipelineContext) -> None:
+    """Pre-populate _workspace/ with analyst plan (DeepSeek design + Qwen hints) and review feedback.
+
+    Lets the project's solve-issue skill skip Phase 1 (analyst) and start from kmp-developer.
+    If the existing workspace is from a different issue, rotate it to _workspace_prev_{issue}_{ts}/.
+    """
+    workspace = Path(ctx.project_path) / "_workspace"
+    existing_plan = workspace / "01_analyst_plan.md"
+    # Rotate stale workspace from a different issue (keep across review retries of the same issue)
+    if existing_plan.exists():
+        try:
+            header = existing_plan.read_text(errors="replace").splitlines()[0]
+            if header and f"Issue #{ctx.issue_num}" not in header:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                workspace.rename(workspace.parent / f"_workspace_prev_{ts}")
+        except OSError:
+            pass
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    plan_parts = [
+        f"# Issue #{ctx.issue_num} — Pre-analyzed Plan",
+        "",
+        "> 이 파일은 ai-orchestrator 파이프라인(DeepSeek 설계 + Qwen 힌트)이 자동 생성했다.",
+        "> `kmp-developer` 에이전트는 이 내용을 기반으로 바로 구현을 시작한다.",
+        "",
+        "## 설계안 (DeepSeek)",
+        "",
+        ctx.design_plan or "(없음)",
+    ]
+    if ctx.qwen_hints:
+        plan_parts.extend(["", "## 코드 힌트 (Qwen2.5-Coder)", "", ctx.qwen_hints])
+    if ctx.draft_context_diff:
+        plan_parts.extend(["", "## 참고: 현재 diff 스냅샷", "", ctx.draft_context_diff])
+
+    (workspace / "01_analyst_plan.md").write_text("\n".join(plan_parts))
+
+    if ctx.review_feedback:
+        (workspace / "review_feedback.md").write_text(
+            f"# Review Feedback (Previous Iteration)\n\n"
+            f"이전 구현이 리뷰에서 반려됨. 아래 이슈를 모두 해결하라.\n\n"
+            f"{ctx.review_feedback}\n"
+        )
+
+
 async def step_claude_implement(
     ctx: PipelineContext,
     settings: Settings,
@@ -983,42 +1077,75 @@ async def step_claude_implement(
     progress_cb: ProgressCallback,
     step_index: int = 2,
 ) -> None:
-    """Step 2: Claude CLI implements based on DeepSeek's design and Qwen's hints."""
+    """Step 2: Claude implements — delegates to project harness if available, else legacy single-shot."""
     step = ctx.steps[step_index]
     step.status = "running"
     start = time.monotonic()
 
-    qwen_section = ""
-    if ctx.qwen_hints:
-        qwen_section = (
-            f"\n\n--- Code Suggestions (from Qwen2.5-Coder) ---\n{ctx.qwen_hints}\n---\n"
-            f"Use the above code suggestions as a starting reference.\n"
+    # Harness delegation: use solve-issue skill if project defines one
+    harness_skill = Path(ctx.project_path) / ".claude" / "skills" / "solve-issue" / "SKILL.md"
+    use_harness = harness_skill.exists()
+
+    if use_harness:
+        _write_harness_workspace(ctx)
+        model = settings.opus_model
+        feedback_hint = (
+            "Review feedback from the previous iteration is at `_workspace/review_feedback.md` — "
+            "address every issue before finalizing.\n"
+        ) if ctx.review_feedback else ""
+        prompt = (
+            f"Use the `solve-issue` skill at `.claude/skills/solve-issue/SKILL.md` to solve GitHub "
+            f"issue #{ctx.issue_num}.\n\n"
+            f"IMPORTANT CONTEXT:\n"
+            f"- The analyst plan (pre-computed from DeepSeek design + Qwen hints) is already at "
+            f"`_workspace/01_analyst_plan.md`.\n"
+            f"- Skip Phase 0 (branch setup) — already on the correct branch.\n"
+            f"- Skip Phase 1 (issue-analyst) — plan is prepared.\n"
+            f"- START at Phase 2: invoke the `kmp-developer` agent to implement from the plan, "
+            f"then invoke `ci-guardian` for ktlint/detekt/build verification.\n\n"
+            f"{feedback_hint}"
+            f"GIT RESTRICTIONS:\n"
+            f"- Do NOT create branches, push, or create PRs.\n"
+            f"- Only commit locally."
+        )
+    else:
+        qwen_section = ""
+        if ctx.qwen_hints:
+            qwen_section = (
+                f"\n\n--- Code Suggestions (from Qwen2.5-Coder) ---\n{ctx.qwen_hints}\n---\n"
+                f"Use the above code suggestions as a starting reference.\n"
+            )
+
+        prompt = (
+            f"Read .claude/CLAUDE.md first and follow the defined pipeline. "
+            f"Then read GitHub issue #{ctx.issue_num} with `gh issue view {ctx.issue_num}`. "
+            f"\n\n--- Design Guide ---\n{ctx.design_plan}\n---\n"
+            f"{qwen_section}\n"
+            f"Implement the solution following TDD (tests first, then code). "
+            f"Run compile/build and full test suite before finishing.\n\n"
+            f"GIT RESTRICTIONS:\n"
+            f"- Do NOT create branches, push, or create PRs.\n"
+            f"- Only commit locally."
         )
 
-    prompt = (
-        f"Read .claude/CLAUDE.md first and follow the defined pipeline. "
-        f"Then read GitHub issue #{ctx.issue_num} with `gh issue view {ctx.issue_num}`. "
-        f"\n\n--- Design Guide ---\n{ctx.design_plan}\n---\n"
-        f"{qwen_section}\n"
-        f"Implement the solution following TDD (tests first, then code). "
-        f"Run compile/build and full test suite before finishing.\n\n"
-        f"GIT RESTRICTIONS:\n"
-        f"- Do NOT create branches, push, or create PRs.\n"
-        f"- Only commit locally."
+        if ctx.draft_context_diff:
+            prompt += f"\n\n{ctx.draft_context_diff}\n"
+
+        if ctx.review_feedback:
+            prompt += (
+                f"\n\n--- Previous Review Feedback (MUST address these issues) ---\n"
+                f"{ctx.review_feedback}\n---\n\n"
+                f"The previous implementation was rejected. Fix ALL issues mentioned above."
+            )
+        model = settings.sonnet_model
+
+    logger.info(
+        "step_claude_implement: project=%s harness=%s model=%s",
+        ctx.project_name, use_harness, model,
     )
 
-    if ctx.draft_context_diff:
-        prompt += f"\n\n{ctx.draft_context_diff}\n"
-
-    if ctx.review_feedback:
-        prompt += (
-            f"\n\n--- Previous Review Feedback (MUST address these issues) ---\n"
-            f"{ctx.review_feedback}\n---\n\n"
-            f"The previous implementation was rejected. Fix ALL issues mentioned above."
-        )
-
     proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", "--model", settings.sonnet_model,
+        "claude", "-p", "--model", model,
         "--dangerously-skip-permissions",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
@@ -1038,6 +1165,7 @@ async def step_claude_implement(
 
     read_task = asyncio.create_task(_read_output())
 
+    last_reap = time.monotonic()
     try:
         while not read_task.done():
             await asyncio.sleep(10)
@@ -1058,6 +1186,12 @@ async def step_claude_implement(
                 step.detail = f"Timed out after {settings.solve_timeout}s"
                 step.elapsed_sec = time.monotonic() - start
                 raise TimeoutError(step.detail)
+
+            # Reap zombie Gradle workers every 3 minutes
+            now = time.monotonic()
+            if now - last_reap > 180:
+                last_reap = now
+                await _reap_zombie_gradle(ctx.project_path)
 
             mins, secs = divmod(elapsed, 60)
             await progress_cb(f"Claude Implement [{mins}m {secs}s]")
@@ -1085,16 +1219,16 @@ async def step_claude_implement(
         )
 
         if not ctx.git_diff.strip():
-            # Check if Sonnet indicated the work is already done
+            # Check if Claude indicated the work is already done
             tail = collected[-1000:].strip() if collected else ""
             if _detect_already_implemented(tail):
-                logger.info("Sonnet reports issue already implemented — treating as success")
+                logger.info("Claude reports issue already implemented — treating as success")
                 step.status = "passed"
                 step.detail = "Already implemented (no changes needed)"
                 ctx.git_diff = "(already implemented)"
             else:
                 step.status = "failed"
-                logger.warning("Sonnet produced no changes. Output tail:\n%s", tail[-500:])
+                logger.warning("Claude produced no changes. Output tail:\n%s", tail[-500:])
                 step.detail = f"No changes produced. Output: {tail[:300]}"
                 step.elapsed_sec = time.monotonic() - start
                 raise RuntimeError("Claude produced no code changes")
@@ -1712,7 +1846,7 @@ async def step_opus_design(
             progress_cb=progress_cb,
             step_name=f"{model_label} Design",
             cwd=ctx.project_path,
-            max_turns=3,
+            max_turns=15,
         )
         ctx.design_doc = output
 
@@ -2561,6 +2695,8 @@ async def run_fivebrid_pipeline(
         # Ensure scheduler is notified on any exit path (set() is idempotent)
         if scheduler and not ctx.ai_audit_passed:
             scheduler.notify_audit_failed(ctx.issue_num)
+        # Clean up any orphaned Gradle processes from this project
+        await _stop_gradle_daemon(ctx.project_path)
 
 
 # ── Internal Helpers ─────────────────────────────────────────────────────────
