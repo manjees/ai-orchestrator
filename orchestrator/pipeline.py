@@ -1724,7 +1724,7 @@ async def step_haiku_research(
         output = await _call_claude_cli_with_progress(
             prompt,
             model=settings.haiku_model,
-            timeout=settings.triage_timeout,
+            timeout=settings.haiku_research_timeout,
             progress_cb=progress_cb,
             step_name="Haiku Research",
             cwd=ctx.project_path,

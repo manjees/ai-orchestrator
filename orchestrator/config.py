@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     # Adaptive Pipeline
     solve_mode: str = "auto"  # "auto" | "express" | "standard" | "full"
     triage_timeout: int = 30       # Haiku triage (seconds)
+    haiku_research_timeout: int = 120  # Haiku research (issue + code exploration)
     split_timeout: int = 120       # Opus split analysis (seconds)
     strategy_approval_timeout: int = 300  # User approval wait (5 min)
 
